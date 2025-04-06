@@ -1,54 +1,272 @@
-version: '3.6'
+version: '3.8'
+
 services:
+  # 初始化容器，用于设置权限
   init:
     image: alpine
     command:
       - /bin/sh
       - -c
       - |
-        chown -R 1000:1000 /data
-
-        echo "done grany data directory permission"
+        chown -R 1000:1000 /data1 /data2 /data3 /data4 /data5 /data_fullnode
+        echo "Granted data directory permissions for all nodes"
     volumes:
-      - data:/data
+      - data1:/data1
+      - data2:/data2
+      - data3:/data3
+      - data4:/data4
+      - data5:/data5
+      - data_fullnode:/data_fullnode
 
-  bsc:
+  # 节点1
+  bsc-node1:
     build:
       context: .
       dockerfile: Dockerfile
     environment:
-      - NETWORK=mainnet
+      - NETWORK=private
+      - NODE_ID=1
     restart: unless-stopped
     ports:
-      - 30303:30303
-      - 30311:30311
-      - 8545:8545
-      - 8546:8546
-      - 8575:8575
-      - 8576:8576
+      - "30303:30303"
+      - "30311:30311"
+      - "8545:8545"
+      - "8546:8546"
+      - "8575:8575"
+      - "8576:8576"
     healthcheck:
       test: |
         [[ "$NETWORK" == "testnet" ]] && PORT=8575 || PORT=8545;
         netstat -tunlp | grep $PORT > /dev/null; if [ 0 != $$? ]; then exit 1; else exit 0; fi;
-
       interval: 5s
       retries: 5
       start_period: 10s
       timeout: 3s
     volumes:
-      - data:/data
-      - config:/bsc/config
+      - data1:/data
+      - config1:/bsc/config
+
+  # 节点2
+  bsc-node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NETWORK=private
+      - NODE_ID=2
+    restart: unless-stopped
+    ports:
+      - "30304:30303"
+      - "30312:30311"
+      - "8547:8545"
+      - "8548:8546"
+      - "8577:8575"
+      - "8578:8576"
+    healthcheck:
+      test: |
+        [[ "$NETWORK" == "testnet" ]] && PORT=8575 || PORT=8545;
+        netstat -tunlp | grep $PORT > /dev/null; if [ 0 != $$? ]; then exit 1; else exit 0; fi;
+      interval: 5s
+      retries: 5
+      start_period: 10s
+      timeout: 3s
+    volumes:
+      - data2:/data
+      - config2:/bsc/config
+
+  # 节点3
+  bsc-node3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NETWORK=private
+      - NODE_ID=3
+    restart: unless-stopped
+    ports:
+      - "30305:30303"
+      - "30313:30311"
+      - "8549:8545"
+      - "8550:8546"
+      - "8579:8575"
+      - "8580:8576"
+    healthcheck:
+      test: |
+        [[ "$NETWORK" == "testnet" ]] && PORT=8575 || PORT=8545;
+        netstat -tunlp | grep $PORT > /dev/null; if [ 0 != $$? ]; then exit 1; else exit 0; fi;
+      interval: 5s
+      retries: 5
+      start_period: 10s
+      timeout: 3s
+    volumes:
+      - data3:/data
+      - config3:/bsc/config
+
+  # 节点4
+  bsc-node4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NETWORK=private
+      - NODE_ID=4
+    restart: unless-stopped
+    ports:
+      - "30306:30303"
+      - "30314:30311"
+      - "8551:8545"
+      - "8552:8546"
+      - "8581:8575"
+      - "8582:8576"
+    healthcheck:
+      test: |
+        [[ "$NETWORK" == "testnet" ]] && PORT=8575 || PORT=8545;
+        netstat -tunlp | grep $PORT > /dev/null; if [ 0 != $$? ]; then exit 1; else exit 0; fi;
+      interval: 5s
+      retries: 5
+      start_period: 10s
+      timeout: 3s
+    volumes:
+      - data4:/data
+      - config4:/bsc/config
+
+  # 节点5
+  bsc-node5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NETWORK=private
+      - NODE_ID=5
+    restart: unless-stopped
+    ports:
+      - "30307:30303"
+      - "30315:30311"
+      - "8553:8545"
+      - "8554:8546"
+      - "8583:8575"
+      - "8584:8576"
+    healthcheck:
+      test: |
+        [[ "$NETWORK" == "testnet" ]] && PORT=8575 || PORT=8545;
+        netstat -tunlp | grep $PORT > /dev/null; if [ 0 != $$? ]; then exit 1; else exit 0; fi;
+      interval: 5s
+      retries: 5
+      start_period: 10s
+      timeout: 3s
+    volumes:
+      - data5:/data
+      - config5:/bsc/config
+
+  # Fullnode节点
+  bsc-fullnode:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NETWORK=private
+      - NODE_TYPE=fullnode
+    restart: unless-stopped
+    ports:
+      - "30308:30303"
+      - "30316:30311"
+      - "8555:8545"
+      - "8556:8546"
+      - "8585:8575"
+      - "8586:8576"
+    healthcheck:
+      test: |
+        [[ "$NETWORK" == "testnet" ]] && PORT=8575 || PORT=8545;
+        netstat -tunlp | grep $PORT > /dev/null; if [ 0 != $$? ]; then exit 1; else exit 0; fi;
+      interval: 5s
+      retries: 5
+      start_period: 10s
+      timeout: 3s
+    volumes:
+      - data_fullnode:/data
+      - config_fullnode:/bsc/config
 
 volumes:
-  config:
+  # 节点1的持久化存储
+  data1:
     driver: local
     driver_opts:
       type: 'none'
       o: 'bind'
-      device: '/tmp/bsc/config/mainnet'
-  data:
+      device: '/tmp/bsc/data/node1'
+  config1:
     driver: local
     driver_opts:
       type: 'none'
       o: 'bind'
-      device: '/tmp/bsc/data/mainnet'
+      device: '/tmp/bsc/config/node1'
+
+  # 节点2的持久化存储
+  data2:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/data/node2'
+  config2:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/config/node2'
+
+  # 节点3的持久化存储
+  data3:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/data/node3'
+  config3:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/config/node3'
+
+  # 节点4的持久化存储
+  data4:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/data/node4'
+  config4:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/config/node4'
+
+  # 节点5的持久化存储
+  data5:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/data/node5'
+  config5:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/config/node5'
+
+  # Fullnode节点的持久化存储
+  data_fullnode:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/data/fullnode'
+  config_fullnode:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: '/tmp/bsc/config/fullnode'
