@@ -4,11 +4,28 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ethereum/go-ethereum/log"
+
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
+	"github.com/ethereum/go-ethereum/rlp"
+)
+
+const (
+	// MaxRequestRangeBlocksCount is the maximum number of blocks to serve per
+	// GetBlocksByRange request. Mostly there to bound disk lookups; with BSC's
+	// typical block size, the practical limit will always be softResponseLimit.
+	MaxRequestRangeBlocksCount = 64
+
+	// softResponseLimit is the target maximum size of replies. The hard cap on
+	// the wire is maxMessageSize (10MB); 8MB leaves headroom for outer RLP/p2p
+	// framing. Each entry's measured size includes sidecars.
+	softResponseLimit = 8 * 1024 * 1024
 )
 
 // Handler is a callback to invoke from an outside runner after the boilerplate
@@ -79,7 +96,27 @@ type Decoder interface {
 }
 
 var bsc1 = map[uint64]msgHandler{
-	VotesMsg: handleVotes,
+	BscCapMsg: handleBscCap, // ignore capability message for backward compatibility
+	VotesMsg:  handleVotes,
+}
+
+var bsc2 = map[uint64]msgHandler{
+	BscCapMsg:           handleBscCap, // ignore capability message for backward compatibility
+	VotesMsg:            handleVotes,
+	GetBlocksByRangeMsg: handleGetBlocksByRange,
+	BlocksByRangeMsg:    handleBlocksByRange,
+}
+
+// handleBscCap ignores the capability message for backward compatibility.
+// Old nodes send BscCapMsg as part of their handshake, we just ignore it
+// since P2P layer already negotiated the protocol version.
+func handleBscCap(backend Backend, msg Decoder, peer *Peer) error {
+	// Decode the message to consume it, but ignore the content
+	var cap BscCapPacket
+	if err := msg.Decode(&cap); err != nil {
+		return nil // ignore decode errors for backward compatibility
+	}
+	return nil
 }
 
 // handleMessage is invoked whenever an inbound message is received from a
@@ -97,6 +134,9 @@ func handleMessage(backend Backend, peer *Peer) error {
 	defer msg.Discard()
 
 	var handlers = bsc1
+	if peer.Version() >= Bsc2 {
+		handlers = bsc2
+	}
 
 	// Track the amount of time it takes to serve the request and run the handler
 	if metrics.Enabled() {
@@ -121,9 +161,94 @@ func handleVotes(backend Backend, msg Decoder, peer *Peer) error {
 	if err := msg.Decode(ann); err != nil {
 		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 	}
+	// Charge limiter by vote count, not packet count, to match the documented
+	// intent of receiveRateLimitPerSecond (see peer.go:23-27).
+	if peer.IsOverLimitAfterReceivingVotes(uint(len(ann.Votes))) {
+		return nil
+	}
 	// Schedule all the unknown hashes for retrieval
 	peer.markVotes(ann.Votes)
 	return backend.Handle(peer, ann)
+}
+
+func handleGetBlocksByRange(backend Backend, msg Decoder, peer *Peer) error {
+	req := new(GetBlocksByRangePacket)
+	if err := msg.Decode(req); err != nil {
+		return fmt.Errorf("msg %v, decode err: %v", GetBlocksByRangeMsg, err)
+	}
+
+	log.Debug("receive GetBlocksByRange request", "from", peer.id, "req", req)
+	// Validate request parameters
+	if req.Count == 0 || req.Count > MaxRequestRangeBlocksCount { // Limit maximum request count
+		return fmt.Errorf("msg %v, invalid count: %v", GetBlocksByRangeMsg, req.Count)
+	}
+
+	// Rate-limit block serving per peer, mirroring the vote receive-rate limiter
+	// (handleVotes). A small request can force up to softResponseLimit of disk
+	// lookups, RLP encoding and upload; once a peer has spent its rolling
+	// per-period serving budget, drop further range requests (silently, like
+	// votes — keep the connection) until the period rolls over. The check runs
+	// before any disk lookup so a spamming peer stops costing work.
+	if peer.IsOverBlockServeLimit() {
+		log.Debug("drop GetBlocksByRange over serve rate limit", "from", peer.id)
+		return nil
+	}
+
+	// Get requested blocks
+	blocks := make([]rlp.RawValue, 0, req.Count)
+	var block *types.Block
+	// Prioritize blockHash query, get block & sidecars from db
+	if req.StartBlockHash != (common.Hash{}) {
+		block = backend.Chain().GetBlockByHash(req.StartBlockHash)
+	} else {
+		block = backend.Chain().GetBlockByNumber(req.StartBlockHeight)
+	}
+	if block == nil {
+		return fmt.Errorf("msg %v, cannot get start block: %v, %v", GetBlocksByRangeMsg, req.StartBlockHeight, req.StartBlockHash)
+	}
+	responseSize := 0
+	for i := uint64(0); i < req.Count; i++ {
+		if i > 0 {
+			block = backend.Chain().GetBlockByHash(block.ParentHash())
+			if block == nil {
+				break
+			}
+		}
+		enc, err := rlp.EncodeToBytes(NewBlockData(block))
+		if err != nil {
+			log.Error("failed to encode BlockData", "hash", block.Hash(), "err", err)
+			break
+		}
+		if len(blocks) > 0 && responseSize+len(enc) > softResponseLimit {
+			break // already have at least one block; next entry would overflow
+		}
+		blocks = append(blocks, enc)
+		responseSize += len(enc)
+	}
+
+	// Account the bytes actually served against the peer's rolling budget.
+	peer.ChargeBlockServe(uint64(responseSize))
+
+	log.Debug("reply GetBlocksByRange msg", "from", peer.id, "req", req.Count, "blocks", len(blocks), "responseSize", responseSize)
+	return p2p.Send(peer.rw, BlocksByRangeMsg, &BlocksByRangeRLPPacket{
+		RequestId: req.RequestId,
+		Blocks:    blocks,
+	})
+}
+
+func handleBlocksByRange(backend Backend, msg Decoder, peer *Peer) error {
+	res := new(BlocksByRangePacket)
+	if err := msg.Decode(res); err != nil {
+		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
+	}
+
+	err := peer.dispatcher.DispatchResponse(&Response{
+		requestID: res.RequestId,
+		data:      res,
+		code:      BlocksByRangeMsg,
+	})
+	log.Debug("receive BlocksByRange response", "from", peer.id, "requestId", res.RequestId, "blocks", len(res.Blocks), "err", err)
+	return nil
 }
 
 // NodeInfo represents a short summary of the `bsc` sub-protocol metadata

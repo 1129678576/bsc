@@ -93,8 +93,16 @@ type Config struct {
 	// DirectBroadcast enable directly broadcast mined block to all peers
 	DirectBroadcast bool `toml:",omitempty"`
 
+	// EnableEVNFeatures enables the direct broadcast feature and disables the transaction broadcast feature.
+	// Used mainly for validators or sentry nodes, which can be recognized by the StakHub contract.
+	// Note: EVN = Enhanced Validator Network, Validator and sentry nodes need to set this flag to true.
+	EnableEVNFeatures bool `toml:",omitempty"`
+
 	// DisableSnapProtocol disable the snap protocol
 	DisableSnapProtocol bool `toml:",omitempty"`
+
+	// EnableQuickBlockFetching indicates whether to fetch new blocks using new messages.
+	EnableQuickBlockFetching bool `toml:",omitempty"`
 
 	// RangeLimit enable 5000 blocks limit when handle range query
 	RangeLimit bool `toml:",omitempty"`
@@ -185,6 +193,10 @@ type Config struct {
 	// private APIs to untrusted users is a major security risk.
 	WSExposeAll bool `toml:",omitempty"`
 
+	// WSMessageSizeLimit specifies the maximum size in bytes for a single WebSocket message.
+	// If this field is zero, the default message size limit will be used.
+	WSMessageSizeLimit int64 `toml:",omitempty"`
+
 	// GraphQLCors is the Cross-Origin Resource Sharing header to send to requesting
 	// clients. Please be aware that CORS is a browser enforced security, it's fully
 	// useless for custom HTTP clients.
@@ -200,11 +212,9 @@ type Config struct {
 	GraphQLVirtualHosts []string `toml:",omitempty"`
 
 	// Logger is a custom logger to use with the p2p.Server.
-	Logger log.Logger `toml:",omitempty"`
+	Logger log.Logger `toml:"-,omitempty"`
 
 	LogConfig *LogConfig `toml:",omitempty"`
-
-	oldGethResourceWarning bool
 
 	// AllowUnprotectedTxs allows non EIP-155 protected transactions to be send over RPC.
 	AllowUnprotectedTxs bool `toml:",omitempty"`
@@ -238,9 +248,31 @@ type Config struct {
 	// EnablePersonal enables the deprecated personal namespace.
 	EnablePersonal bool `toml:"-"`
 
+	// Configures database engine used by the node.
 	DBEngine string `toml:",omitempty"`
 
 	Instance int `toml:",omitempty"`
+
+	// Configures OpenTelemetry reporting.
+	OpenTelemetry OpenTelemetryConfig `toml:",omitempty"`
+
+	oldGethResourceWarning bool
+}
+
+// OpenTelemetryConfig has settings for
+type OpenTelemetryConfig struct {
+	Enabled bool `toml:",omitempty"`
+
+	Tags       string `toml:",omitempty"`
+	InstanceID string `toml:",omitempty"`
+
+	// Exporter endpoint.
+	Endpoint     string `toml:",omitempty"`
+	AuthUser     string `toml:",omitempty"`
+	AuthPassword string `toml:",omitempty"`
+
+	// Percentage of sampled traces.
+	SampleRatio float64 `toml:",omitempty"`
 }
 
 // IPCEndpoint resolves an IPC endpoint based on a configured value, taking into

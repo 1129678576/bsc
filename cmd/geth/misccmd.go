@@ -22,21 +22,12 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/internal/version"
 	"github.com/urfave/cli/v2"
 )
 
 var (
-	VersionCheckUrlFlag = &cli.StringFlag{
-		Name:  "check.url",
-		Usage: "URL to use when checking vulnerabilities",
-		Value: "https://geth.ethereum.org/docs/vulnerabilities/vulnerabilities.json",
-	}
-	VersionCheckVersionFlag = &cli.StringFlag{
-		Name:  "check.version",
-		Usage: "Version to check",
-		Value: version.ClientName(clientIdentifier),
-	}
 	versionCommand = &cli.Command{
 		Action:    printVersion,
 		Name:      "version",
@@ -44,20 +35,6 @@ var (
 		ArgsUsage: " ",
 		Description: `
 The output of this command is supposed to be machine-readable.
-`,
-	}
-	versionCheckCommand = &cli.Command{
-		Action: versionCheck,
-		Flags: []cli.Flag{
-			VersionCheckUrlFlag,
-			VersionCheckVersionFlag,
-		},
-		Name:      "version-check",
-		Usage:     "Checks (online) for known Geth security vulnerabilities",
-		ArgsUsage: "<versionstring (optional)>",
-		Description: `
-The version-check command fetches vulnerability-information from https://geth.ethereum.org/docs/vulnerabilities/vulnerabilities.json, 
-and displays information about any security vulnerabilities that affect the currently executing version.
 `,
 	}
 	licenseCommand = &cli.Command{
@@ -83,7 +60,8 @@ func printVersion(ctx *cli.Context) error {
 	fmt.Println("Go Version:", runtime.Version())
 	fmt.Println("Operating System:", runtime.GOOS)
 	fmt.Printf("GOPATH=%s\n", os.Getenv("GOPATH"))
-	fmt.Printf("GOROOT=%s\n", runtime.GOROOT())
+	goRoot, _ := common.GetGoRoot()
+	fmt.Printf("GOROOT=%s\n", goRoot)
 	return nil
 }
 

@@ -66,10 +66,10 @@ func (s *Suite) dialAs(key *ecdsa.PrivateKey) (*Conn, error) {
 		return nil, err
 	}
 	conn.caps = []p2p.Cap{
-		{Name: "eth", Version: 67},
-		{Name: "eth", Version: 68},
+		{Name: "eth", Version: eth.ETH70},
+		{Name: "eth", Version: eth.ETH68},
 	}
-	conn.ourHighestProtoVersion = 68
+	conn.ourHighestProtoVersion = eth.ETH70
 	return &conn, nil
 }
 
@@ -130,11 +130,16 @@ func (c *Conn) Write(proto Proto, code uint64, msg any) error {
 	return err
 }
 
+var errDisc error = errors.New("disconnect")
+
 // ReadEth reads an Eth sub-protocol wire message.
 func (c *Conn) ReadEth() (any, error) {
 	c.SetReadDeadline(time.Now().Add(timeout))
 	for {
 		code, data, _, err := c.Conn.Read()
+		if code == discMsg {
+			return nil, errDisc
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -160,10 +165,6 @@ func (c *Conn) ReadEth() (any, error) {
 			msg = new(eth.GetBlockBodiesPacket)
 		case eth.BlockBodiesMsg:
 			msg = new(eth.BlockBodiesPacket)
-		case eth.NewBlockMsg:
-			msg = new(eth.NewBlockPacket)
-		case eth.NewBlockHashesMsg:
-			msg = new(eth.NewBlockHashesPacket)
 		case eth.TransactionsMsg:
 			msg = new(eth.TransactionsPacket)
 		case eth.NewPooledTransactionHashesMsg:
@@ -194,7 +195,7 @@ func (c *Conn) ReadSnap() (any, error) {
 			// Read until snap message.
 			continue
 		}
-		code -= baseProtoLen + ethProtoLen
+		code -= protoOffset(snapProto)
 
 		var msg any
 		switch int(code) {
@@ -222,6 +223,18 @@ func (c *Conn) ReadSnap() (any, error) {
 		}
 		return msg, nil
 	}
+}
+
+// dialAndPeer creates a peer connection and runs the handshake.
+func (s *Suite) dialAndPeer(status *eth.StatusPacket) (*Conn, error) {
+	c, err := s.dial()
+	if err != nil {
+		return nil, err
+	}
+	if err = c.peer(s.chain, status); err != nil {
+		c.Close()
+	}
+	return c, err
 }
 
 // peer performs both the protocol handshake and the status message
@@ -300,7 +313,6 @@ func (c *Conn) negotiateEthProtocol(caps []p2p.Cap) {
 
 // statusExchange performs a `Status` message exchange with the given node.
 func (c *Conn) statusExchange(chain *Chain, status *eth.StatusPacket) error {
-loop:
 	for {
 		code, data, err := c.Read()
 		if err != nil {
@@ -308,47 +320,45 @@ loop:
 		}
 		switch code {
 		case eth.StatusMsg + protoOffset(ethProto):
-			msg := new(eth.StatusPacket)
-			if err := rlp.DecodeBytes(data, &msg); err != nil {
-				return fmt.Errorf("error decoding status packet: %w", err)
+			if c.negotiatedProtoVersion == 0 {
+				return errors.New("eth protocol version must be set in Conn")
 			}
-			if have, want := msg.Head, chain.blocks[chain.Len()-1].Hash(); have != want {
-				return fmt.Errorf("wrong head block in status, want:  %#x (block %d) have %#x",
+			msg := new(eth.StatusPacket)
+			if err := rlp.DecodeBytes(data, msg); err != nil {
+				return fmt.Errorf("error decoding eth/70 status packet: %w", err)
+			}
+			if uint(msg.ProtocolVersion) != c.negotiatedProtoVersion {
+				return fmt.Errorf("mismatched eth protocol version: node %d, negotiated %d", msg.ProtocolVersion, c.negotiatedProtoVersion)
+			}
+			if have, want := msg.LatestBlock, chain.blocks[chain.Len()-1].NumberU64(); have != want {
+				return fmt.Errorf("wrong latest block number in status: have %d, want %d", have, want)
+			}
+			if have, want := msg.LatestBlockHash, chain.blocks[chain.Len()-1].Hash(); have != want {
+				return fmt.Errorf("wrong latest block in status, want %#x (block %d), have %#x",
 					want, chain.blocks[chain.Len()-1].NumberU64(), have)
+			}
+			if msg.TD == nil || msg.TD.Cmp(chain.TD()) != 0 {
+				return fmt.Errorf("wrong total difficulty in status: have %v, want %v", msg.TD, chain.TD())
 			}
 			if have, want := msg.ForkID, chain.ForkID(); !reflect.DeepEqual(have, want) {
 				return fmt.Errorf("wrong fork ID in status: have %v, want %v", have, want)
 			}
-			if have, want := msg.ProtocolVersion, c.ourHighestProtoVersion; have != uint32(want) {
-				return fmt.Errorf("wrong protocol version: have %v, want %v", have, want)
-			}
-			// make sure eth protocol version is set for negotiation
-			if c.negotiatedProtoVersion == 0 {
-				return errors.New("eth protocol version must be set in Conn")
-			}
 			if status == nil {
-				// default status message
 				status = &eth.StatusPacket{
 					ProtocolVersion: uint32(c.negotiatedProtoVersion),
 					NetworkID:       chain.config.ChainID.Uint64(),
 					TD:              chain.TD(),
-					Head:            chain.blocks[chain.Len()-1].Hash(),
 					Genesis:         chain.blocks[0].Hash(),
 					ForkID:          chain.ForkID(),
+					EarliestBlock:   0,
+					LatestBlock:     chain.blocks[chain.Len()-1].NumberU64(),
+					LatestBlockHash: chain.blocks[chain.Len()-1].Hash(),
 				}
 			}
 			if err := c.Write(ethProto, eth.StatusMsg, status); err != nil {
 				return fmt.Errorf("write to connection failed: %v", err)
 			}
-		case eth.UpgradeStatusMsg + protoOffset(ethProto):
-			msg := new(eth.UpgradeStatusPacket)
-			if err := rlp.DecodeBytes(data, &msg); err != nil {
-				return fmt.Errorf("error decoding status packet: %w", err)
-			}
-			if err := c.Write(ethProto, eth.UpgradeStatusMsg, msg); err != nil {
-				return fmt.Errorf("write to connection failed: %v", err)
-			}
-			break loop
+			return nil
 		case discMsg:
 			var msg []p2p.DiscReason
 			if rlp.DecodeBytes(data, &msg); len(msg) == 0 {
@@ -363,6 +373,4 @@ loop:
 			return fmt.Errorf("bad status message: code %d", code)
 		}
 	}
-
-	return nil
 }

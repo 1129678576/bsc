@@ -23,41 +23,87 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+)
+
+// Default timing configurations
+var (
+	defaultRecommit              = 10 * time.Second
+	defaultMaxWaitProposalInSecs = uint64(45)
+
+	defaultGasCeil = uint64(55_000_000)
+	// Extra time for finalizing and committing blocks (excludes writing to disk).
+	defaultDelayLeftOver         = 15 * time.Millisecond
+	defaultBidSimulationLeftOver = 20 * time.Millisecond
+
+	// defaultBidBlockRevokesJournal is resolved relative to the node's datadir.
+	defaultBidBlockRevokesJournal = "bidblockrevokes.json"
+)
+
+func getDefaultNoInterruptLeftOver() *time.Duration {
+	expectedProcessingSpeed := 500_000_000 // For estimation, assume 500 Mgas/s
+	bidProcessing := float64(defaultGasCeil) / float64(expectedProcessingSpeed)
+	buffer := 10 * time.Millisecond
+	noInterruptLeftOver := time.Duration(bidProcessing*float64(time.Second)) + buffer + defaultDelayLeftOver
+
+	return &noInterruptLeftOver
+}
+
+// Other default MEV-related configurations
+var (
+	defaultMevEnabled          = false
+	defaultGreedyMergeTx       = true
+	defaultBuilderFeeCeil      = "0"
+	defaultValidatorCommission = uint64(100)
+	defaultMaxBidsPerBuilder   = uint32(2) // Simple strategy: send one bid early, another near deadline
+	defaultGRPCPort            = 8552
+	defaultGRPCConcurrency     = uint32(32)
+	defaultGRPCRequestTimeout  = 10 * time.Second
+	// MEV validators accept SendBidBlock by default; the RPC stays gated on the
+	// Pasteur fork and can be disabled via Mev.BidBlockEnabled=false.
+	defaultBidBlockEnabled = true
 )
 
 // Config is the configuration parameters of mining.
 type Config struct {
-	Etherbase             common.Address `toml:",omitempty"` // Public address for block mining rewards
-	ExtraData             hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
-	DelayLeftOver         time.Duration  // Time reserved to finalize a block(calculate root, distribute income...)
-	GasFloor              uint64         // Target gas floor for mined blocks.
-	GasCeil               uint64         // Target gas ceiling for mined blocks.
-	GasPrice              *big.Int       // Minimum gas price for mining a transaction
-	Recommit              time.Duration  // The time interval for miner to re-create mining work.
-	VoteEnable            bool           // Whether to vote when mining
-	MaxWaitProposalInSecs uint64         // The maximum time to wait for the proposal to be done, it's aimed to prevent validator being slashed when restarting
+	Etherbase              common.Address `toml:",omitempty"` // Public address for block mining rewards
+	ExtraData              hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
+	DelayLeftOver          *time.Duration `toml:",omitempty"` // Time reserved to finalize a block(calculate root, distribute income...)
+	GasFloor               uint64         // Target gas floor for mined blocks.
+	GasCeil                uint64         // Target gas ceiling for mined blocks.
+	GasPrice               *big.Int       // Minimum gas price for mining a transaction
+	Recommit               *time.Duration `toml:",omitempty"` // The time interval for miner to re-create mining work.
+	VoteEnable             bool           // Whether to vote when mining
+	MaxWaitProposalInSecs  *uint64        `toml:",omitempty"` // The maximum time to wait for the proposal to be done, it's aimed to prevent validator being slashed when restarting
+	DisableVoteAttestation bool           // Whether to skip assembling vote attestation
+	MaxBlobsPerBlock       int            `toml:",omitempty"` // Maximum number of blobs per block (0 for unset uses protocol default)
 
-	DisableVoteAttestation bool // Whether to skip assembling vote attestation
+	// BidBlockRevokesJournal is the file BidBlock revoke lockouts are persisted
+	// to so they survive restarts (BEP-675). A relative path is resolved under
+	// the node's datadir; empty disables persistence. It is validator-local MEV
+	// policy, deliberately kept out of chaindata.
+	BidBlockRevokesJournal string `toml:",omitempty"`
 
 	Mev MevConfig // Mev configuration
 }
 
 // DefaultConfig contains default settings for miner.
 var DefaultConfig = Config{
-	GasCeil:  0,
-	GasPrice: big.NewInt(params.GWei),
-
+	GasCeil:  defaultGasCeil,
+	GasPrice: big.NewInt(params.GWei / 20),
 	// The default recommit time is chosen as two seconds since
 	// consensus-layer usually will wait a half slot of time(6s)
 	// for payload generation. It should be enough for Geth to
 	// run 3 rounds.
-	Recommit:      3 * time.Second,
-	DelayLeftOver: 50 * time.Millisecond,
+	Recommit:      &defaultRecommit,
+	DelayLeftOver: &defaultDelayLeftOver,
 
-	// The default value is set to 30 seconds.
-	// Because the avg restart time in mainnet is around 30s, so the node try to wait for the next multi-proposals to be done.
-	MaxWaitProposalInSecs: 30,
+	// The default value is set to 45 seconds.
+	// Because the avg restart time in mainnet could be 30+ seconds, so the node try to wait for the next multi-proposals to be done.
+	MaxWaitProposalInSecs: &defaultMaxWaitProposalInSecs,
+
+	BidBlockRevokesJournal: defaultBidBlockRevokesJournal,
 
 	Mev: DefaultMevConfig,
 }
@@ -68,24 +114,101 @@ type BuilderConfig struct {
 }
 
 type MevConfig struct {
-	Enabled               bool            // Whether to enable Mev or not
-	GreedyMergeTx         bool            // Whether to merge local transactions to the bid
-	BuilderFeeCeil        string          // The maximum builder fee of a bid
+	Enabled               *bool           `toml:",omitempty"` // Whether to enable Mev or not
+	BidBlockEnabled       *bool           `toml:",omitempty"` // Whether to accept SendBidBlock RPC (BEP-675); coexists with legacy SendBid
+	GreedyMergeTx         *bool           `toml:",omitempty"` // Whether to merge local transactions to the bid
+	BuilderFeeCeil        *string         `toml:",omitempty"` // The maximum builder fee of a bid
 	SentryURL             string          // The url of Mev sentry
 	Builders              []BuilderConfig // The list of builders
-	ValidatorCommission   uint64          // 100 means the validator claims 1% from block reward
-	BidSimulationLeftOver time.Duration
-	NoInterruptLeftOver   time.Duration
-	MaxBidsPerBuilder     uint32 // Maximum number of bids allowed per builder per block
+	ValidatorCommission   *uint64         `toml:",omitempty"` // 100 means the validator claims 1% from block reward
+	BidSimulationLeftOver *time.Duration  `toml:",omitempty"`
+	NoInterruptLeftOver   *time.Duration  `toml:",omitempty"`
+	MaxBidsPerBuilder     *uint32         `toml:",omitempty"` // Maximum number of bids allowed per builder per block
+	GRPCPort              int             `toml:",omitempty"` // BEP-675 BidBlockService listen port; 0 uses the default (use GRPCDisabled to turn the service off)
+	GRPCDisabled          bool            `toml:",omitempty"` // Whether to disable the BEP-675 BidBlockService
+	GRPCConcurrency       uint32          `toml:",omitempty"` // Maximum in-flight gRPC SendBidBlock calls; 0 uses the default
+	GRPCRequestTimeout    time.Duration   `toml:",omitempty"` // Total gRPC request timeout, including body upload; 0 uses the default
 }
 
 var DefaultMevConfig = MevConfig{
-	Enabled:               false,
-	GreedyMergeTx:         true,
+	Enabled:               &defaultMevEnabled,
+	BidBlockEnabled:       &defaultBidBlockEnabled,
+	GreedyMergeTx:         &defaultGreedyMergeTx,
+	BuilderFeeCeil:        &defaultBuilderFeeCeil,
 	SentryURL:             "",
 	Builders:              nil,
-	ValidatorCommission:   100,
-	BidSimulationLeftOver: 50 * time.Millisecond,
-	NoInterruptLeftOver:   400 * time.Millisecond,
-	MaxBidsPerBuilder:     3,
+	ValidatorCommission:   &defaultValidatorCommission,
+	BidSimulationLeftOver: &defaultBidSimulationLeftOver,
+	NoInterruptLeftOver:   getDefaultNoInterruptLeftOver(),
+	MaxBidsPerBuilder:     &defaultMaxBidsPerBuilder,
+	GRPCPort:              defaultGRPCPort,
+	GRPCConcurrency:       defaultGRPCConcurrency,
+	GRPCRequestTimeout:    defaultGRPCRequestTimeout,
+}
+
+func ApplyDefaultMinerConfig(cfg *Config) {
+	if cfg == nil {
+		log.Warn("ApplyDefaultMinerConfig cfg == nil")
+		return
+	}
+
+	// check [Eth.Miner]
+	if cfg.DelayLeftOver == nil {
+		cfg.DelayLeftOver = &defaultDelayLeftOver
+		log.Info("ApplyDefaultMinerConfig", "DelayLeftOver", *cfg.DelayLeftOver)
+	}
+	if cfg.MaxWaitProposalInSecs == nil {
+		cfg.MaxWaitProposalInSecs = &defaultMaxWaitProposalInSecs
+		log.Info("ApplyDefaultMinerConfig", "MaxWaitProposalInSecs", *cfg.MaxWaitProposalInSecs)
+	}
+	if cfg.Recommit == nil {
+		cfg.Recommit = &defaultRecommit
+		log.Info("ApplyDefaultMinerConfig", "Recommit", *cfg.Recommit)
+	}
+
+	// check [Eth.Miner.Mev]
+	if cfg.Mev.Enabled == nil {
+		cfg.Mev.Enabled = &defaultMevEnabled
+		log.Info("ApplyDefaultMinerConfig", "Mev.Enabled", *cfg.Mev.Enabled)
+	}
+	if cfg.Mev.BidBlockEnabled == nil {
+		cfg.Mev.BidBlockEnabled = &defaultBidBlockEnabled
+		log.Info("ApplyDefaultMinerConfig", "Mev.BidBlockEnabled", *cfg.Mev.BidBlockEnabled)
+	}
+	if cfg.Mev.BuilderFeeCeil == nil {
+		cfg.Mev.BuilderFeeCeil = &defaultBuilderFeeCeil
+		log.Info("ApplyDefaultMinerConfig", "Mev.BuilderFeeCeil", *cfg.Mev.BuilderFeeCeil)
+	}
+	if cfg.Mev.GreedyMergeTx == nil {
+		cfg.Mev.GreedyMergeTx = &defaultGreedyMergeTx
+		log.Info("ApplyDefaultMinerConfig", "Mev.GreedyMergeTx", *cfg.Mev.GreedyMergeTx)
+	}
+	if cfg.Mev.ValidatorCommission == nil {
+		cfg.Mev.ValidatorCommission = &defaultValidatorCommission
+		log.Info("ApplyDefaultMinerConfig", "Mev.ValidatorCommission", *cfg.Mev.ValidatorCommission)
+	}
+	if cfg.Mev.BidSimulationLeftOver == nil {
+		cfg.Mev.BidSimulationLeftOver = &defaultBidSimulationLeftOver
+		log.Info("ApplyDefaultMinerConfig", "Mev.BidSimulationLeftOver", *cfg.Mev.BidSimulationLeftOver)
+	}
+	if cfg.Mev.NoInterruptLeftOver == nil {
+		cfg.Mev.NoInterruptLeftOver = getDefaultNoInterruptLeftOver()
+		log.Info("ApplyDefaultMinerConfig", "Mev.NoInterruptLeftOver", *cfg.Mev.NoInterruptLeftOver)
+	}
+	if cfg.Mev.MaxBidsPerBuilder == nil {
+		cfg.Mev.MaxBidsPerBuilder = &defaultMaxBidsPerBuilder
+		log.Info("ApplyDefaultMinerConfig", "Mev.MaxBidsPerBuilder", *cfg.Mev.MaxBidsPerBuilder)
+	}
+	if cfg.Mev.GRPCPort <= 0 {
+		cfg.Mev.GRPCPort = defaultGRPCPort
+		log.Info("ApplyDefaultMinerConfig", "Mev.GRPCPort", cfg.Mev.GRPCPort)
+	}
+	if cfg.Mev.GRPCConcurrency == 0 {
+		cfg.Mev.GRPCConcurrency = defaultGRPCConcurrency
+		log.Info("ApplyDefaultMinerConfig", "Mev.GRPCConcurrency", cfg.Mev.GRPCConcurrency)
+	}
+	if cfg.Mev.GRPCRequestTimeout <= 0 {
+		cfg.Mev.GRPCRequestTimeout = defaultGRPCRequestTimeout
+		log.Info("ApplyDefaultMinerConfig", "Mev.GRPCRequestTimeout", cfg.Mev.GRPCRequestTimeout)
+	}
 }

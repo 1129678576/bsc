@@ -27,6 +27,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/ethereum/go-ethereum/eth/catalyst"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 
 	"github.com/ethereum/go-ethereum/accounts"
@@ -34,13 +35,14 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/accounts/scwallet"
 	"github.com/ethereum/go-ethereum/accounts/usbwallet"
-	"github.com/ethereum/go-ethereum/beacon/fakebeacon"
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/internal/flags"
+	"github.com/ethereum/go-ethereum/internal/telemetry/tracesetup"
 	"github.com/ethereum/go-ethereum/internal/version"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -100,6 +102,16 @@ var deprecatedConfigFields = map[string]bool{
 	"ethconfig.Config.LightPeers":              true,
 	"ethconfig.Config.LightNoPrune":            true,
 	"ethconfig.Config.LightNoSyncServe":        true,
+	"legacypool.Config.OverflowPoolSlots":      true,
+
+	// Deprecated May 2026, the incremental snapshot feature was removed.
+	"ethconfig.Config.EnableIncrSnapshots":       true,
+	"ethconfig.Config.IncrSnapshotPath":          true,
+	"ethconfig.Config.IncrSnapshotBlockInterval": true,
+	"ethconfig.Config.IncrSnapshotStateBuffer":   true,
+	"ethconfig.Config.IncrSnapshotKeptBlocks":    true,
+	"ethconfig.Config.UseRemoteIncrSnapshot":     true,
+	"ethconfig.Config.RemoteIncrSnapshotURL":     true,
 }
 
 type ethstatsConfig struct {
@@ -107,11 +119,10 @@ type ethstatsConfig struct {
 }
 
 type gethConfig struct {
-	Eth        ethconfig.Config
-	Node       node.Config
-	Ethstats   ethstatsConfig
-	Metrics    metrics.Config
-	FakeBeacon fakebeacon.Config
+	Eth      ethconfig.Config
+	Node     node.Config
+	Ethstats ethstatsConfig
+	Metrics  metrics.Config
 }
 
 func loadConfig(file string, cfg *gethConfig) error {
@@ -155,6 +166,9 @@ func loadBaseConfig(ctx *cli.Context) gethConfig {
 		if err := loadConfig(file, &cfg); err != nil {
 			utils.Fatalf("%v", err)
 		}
+		// some default options could be overwritten after `loadConfig()`
+		// apply the default value if the options are not specified in config.toml file.
+		ethconfig.ApplyDefaultEthConfig(&cfg.Eth)
 	}
 
 	scheme := cfg.Eth.StateScheme
@@ -190,7 +204,55 @@ func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
 	}
 	applyMetricConfig(ctx, &cfg)
 
+	// do some post loading config logic
+	if cfg.Eth.PruneAncientData {
+		if cfg.Eth.SyncMode != ethconfig.FullSync {
+			log.Warn("pruneancient parameter can only be used with syncmode=full, force to full sync")
+			cfg.Eth.SyncMode = ethconfig.FullSync
+		}
+		cfg.Eth.BlockHistory = params.FullImmutabilityThreshold
+	}
+
 	return stack, cfg
+}
+
+// constructs the disclaimer text block which will be printed in the logs upon
+// startup when Geth is running in dev mode.
+func constructDevModeBanner(ctx *cli.Context, cfg gethConfig) string {
+	devModeBanner := `You are running Geth in --dev mode. Please note the following:
+
+  1. This mode is only intended for fast, iterative development without assumptions on
+     security or persistence.
+  2. The database is created in memory unless specified otherwise. Therefore, shutting down
+     your computer or losing power will wipe your entire block data and chain state for
+     your dev environment.
+  3. A random, pre-allocated developer account will be available and unlocked as
+     eth.coinbase, which can be used for testing. The random dev account is temporary,
+     stored on a ramdisk, and will be lost if your machine is restarted.
+  4. Mining is enabled by default. However, the client will only seal blocks if transactions
+     are pending in the mempool. The miner's minimum accepted gas price is 1.
+  5. Networking is disabled; there is no listen-address, the maximum number of peers is set
+     to 0, and discovery is disabled.
+`
+	if !ctx.IsSet(utils.DataDirFlag.Name) {
+		devModeBanner += fmt.Sprintf(`
+
+ Running in ephemeral mode.  The following account has been prefunded in the genesis:
+
+       Account
+       ------------------
+       0x%x (10^49 ETH)
+`, cfg.Eth.Miner.Etherbase)
+		if cfg.Eth.Miner.Etherbase == utils.DeveloperAddr {
+			devModeBanner += fmt.Sprintf(` 
+       Private Key
+       ------------------
+       0x%x
+`, crypto.FromECDSA(utils.DeveloperKey))
+		}
+	}
+
+	return devModeBanner
 }
 
 // makeFullNode loads geth configuration and creates the Ethereum backend.
@@ -205,21 +267,45 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 		v := ctx.Uint64(utils.OverridePassedForkTime.Name)
 		cfg.Eth.OverridePassedForkTime = &v
 	}
-	if ctx.IsSet(utils.OverridePascal.Name) {
-		v := ctx.Uint64(utils.OverridePascal.Name)
-		cfg.Eth.OverridePascal = &v
-	}
-	if ctx.IsSet(utils.OverridePrague.Name) {
-		v := ctx.Uint64(utils.OverridePrague.Name)
-		cfg.Eth.OverridePrague = &v
-	}
 	if ctx.IsSet(utils.OverrideLorentz.Name) {
 		v := ctx.Uint64(utils.OverrideLorentz.Name)
 		cfg.Eth.OverrideLorentz = &v
 	}
-	if ctx.IsSet(utils.OverrideVerkle.Name) {
-		v := ctx.Uint64(utils.OverrideVerkle.Name)
-		cfg.Eth.OverrideVerkle = &v
+	if ctx.IsSet(utils.OverrideMaxwell.Name) {
+		v := ctx.Uint64(utils.OverrideMaxwell.Name)
+		cfg.Eth.OverrideMaxwell = &v
+	}
+	if ctx.IsSet(utils.OverrideFermi.Name) {
+		v := ctx.Uint64(utils.OverrideFermi.Name)
+		cfg.Eth.OverrideFermi = &v
+	}
+	if ctx.IsSet(utils.OverrideOsaka.Name) {
+		v := ctx.Uint64(utils.OverrideOsaka.Name)
+		cfg.Eth.OverrideOsaka = &v
+	}
+	if ctx.IsSet(utils.OverrideMendel.Name) {
+		v := ctx.Uint64(utils.OverrideMendel.Name)
+		cfg.Eth.OverrideMendel = &v
+	}
+	if ctx.IsSet(utils.OverridePasteur.Name) {
+		v := ctx.Uint64(utils.OverridePasteur.Name)
+		cfg.Eth.OverridePasteur = &v
+	}
+	if ctx.IsSet(utils.OverrideJenner.Name) {
+		v := ctx.Uint64(utils.OverrideJenner.Name)
+		cfg.Eth.OverrideJenner = &v
+	}
+	if ctx.IsSet(utils.OverrideBPO1.Name) {
+		v := ctx.Uint64(utils.OverrideBPO1.Name)
+		cfg.Eth.OverrideBPO1 = &v
+	}
+	if ctx.IsSet(utils.OverrideBPO2.Name) {
+		v := ctx.Uint64(utils.OverrideBPO2.Name)
+		cfg.Eth.OverrideBPO2 = &v
+	}
+	if ctx.IsSet(utils.OverrideUBT.Name) {
+		v := ctx.Uint64(utils.OverrideUBT.Name)
+		cfg.Eth.OverrideUBT = &v
 	}
 	if ctx.IsSet(utils.OverrideFullImmutabilityThreshold.Name) {
 		params.FullImmutabilityThreshold = ctx.Uint64(utils.OverrideFullImmutabilityThreshold.Name)
@@ -227,7 +313,7 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 	}
 	if ctx.IsSet(utils.OverrideMinBlocksForBlobRequests.Name) {
 		params.MinBlocksForBlobRequests = ctx.Uint64(utils.OverrideMinBlocksForBlobRequests.Name)
-		params.MinTimeDurationForBlobRequests = uint64(float64(params.MinBlocksForBlobRequests) * 1.5 /*lorentzBlockInterval*/)
+		params.MinTimeDurationForBlobRequests = uint64(float64(params.MinBlocksForBlobRequests) * 0.45 /*fermiBlockInterval*/)
 	}
 	if ctx.IsSet(utils.OverrideDefaultExtraReserveForBlobRequests.Name) {
 		params.DefaultExtraReserveForBlobRequests = ctx.Uint64(utils.OverrideDefaultExtraReserveForBlobRequests.Name)
@@ -239,6 +325,12 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 		params.FixedTurnLength = ctx.Uint64(utils.OverrideFixedTurnLength.Name)
 	}
 
+	// Setup OpenTelemetry reporting if enabled.
+	if err := tracesetup.SetupTelemetry(cfg.Node.OpenTelemetry, stack); err != nil {
+		utils.Fatalf("failed to setup OpenTelemetry: %v", err)
+	}
+
+	// Add Ethereum service.
 	backend, eth := utils.RegisterEthService(stack, &cfg.Eth)
 
 	// Create gauge with geth system and build information
@@ -259,7 +351,7 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 	filterSystem := utils.RegisterFilterAPI(stack, backend, &cfg.Eth)
 
 	// Configure GraphQL if requested.
-	if ctx.IsSet(utils.GraphQLEnabledFlag.Name) {
+	if ctx.Bool(utils.GraphQLEnabledFlag.Name) {
 		utils.RegisterGraphQLService(stack, backend, filterSystem, &cfg.Node)
 	}
 	// Add the Ethereum Stats daemon if requested.
@@ -267,14 +359,19 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 		utils.RegisterEthStatsService(stack, backend, cfg.Ethstats.URL)
 	}
 
-	if ctx.IsSet(utils.FakeBeaconAddrFlag.Name) {
-		cfg.FakeBeacon.Addr = ctx.String(utils.FakeBeaconAddrFlag.Name)
-	}
-	if ctx.IsSet(utils.FakeBeaconPortFlag.Name) {
-		cfg.FakeBeacon.Port = ctx.Int(utils.FakeBeaconPortFlag.Name)
-	}
-	if cfg.FakeBeacon.Enable || ctx.IsSet(utils.FakeBeaconEnabledFlag.Name) {
-		go fakebeacon.NewService(&cfg.FakeBeacon, backend).Run()
+	if ctx.Bool(utils.DeveloperFlag.Name) {
+		// Start dev mode.
+		simBeacon, err := catalyst.NewSimulatedBeacon(ctx.Uint64(utils.DeveloperPeriodFlag.Name), cfg.Eth.Miner.Etherbase, eth)
+		if err != nil {
+			utils.Fatalf("failed to register dev mode catalyst service: %v", err)
+		}
+		catalyst.RegisterSimulatedBeaconAPIs(stack, simBeacon)
+		stack.RegisterLifecycle(simBeacon)
+
+		banner := constructDevModeBanner(ctx, cfg)
+		for _, line := range strings.Split(banner, "\n") {
+			log.Warn(line)
+		}
 	}
 
 	git, _ := version.VCS()
@@ -321,8 +418,7 @@ func applyMetricConfig(ctx *cli.Context, cfg *gethConfig) {
 		cfg.Metrics.Enabled = ctx.Bool(utils.MetricsEnabledFlag.Name)
 	}
 	if ctx.IsSet(utils.MetricsEnabledExpensiveFlag.Name) {
-		log.Warn("Expensive metrics will remain in BSC and may be removed in the future", "flag", utils.MetricsEnabledExpensiveFlag.Name)
-		cfg.Metrics.EnabledExpensive = ctx.Bool(utils.MetricsEnabledExpensiveFlag.Name)
+		log.Warn("Expensive metrics are collected by default, please remove this flag", "flag", utils.MetricsEnabledExpensiveFlag.Name)
 	}
 	if ctx.IsSet(utils.MetricsHTTPFlag.Name) {
 		cfg.Metrics.HTTP = ctx.String(utils.MetricsHTTPFlag.Name)
@@ -347,6 +443,9 @@ func applyMetricConfig(ctx *cli.Context, cfg *gethConfig) {
 	}
 	if ctx.IsSet(utils.MetricsInfluxDBTagsFlag.Name) {
 		cfg.Metrics.InfluxDBTags = ctx.String(utils.MetricsInfluxDBTagsFlag.Name)
+	}
+	if ctx.IsSet(utils.MetricsInfluxDBIntervalFlag.Name) {
+		cfg.Metrics.InfluxDBInterval = ctx.Duration(utils.MetricsInfluxDBIntervalFlag.Name)
 	}
 	if ctx.IsSet(utils.MetricsEnableInfluxDBV2Flag.Name) {
 		cfg.Metrics.EnableInfluxDBV2 = ctx.Bool(utils.MetricsEnableInfluxDBV2Flag.Name)
@@ -376,9 +475,9 @@ func applyMetricConfig(ctx *cli.Context, cfg *gethConfig) {
 			ctx.IsSet(utils.MetricsInfluxDBBucketFlag.Name)
 
 		if enableExport && v2FlagIsSet {
-			utils.Fatalf("Flags --influxdb.metrics.organization, --influxdb.metrics.token, --influxdb.metrics.bucket are only available for influxdb-v2")
+			utils.Fatalf("Flags --%s, --%s, --%s are only available for influxdb-v2", utils.MetricsInfluxDBOrganizationFlag.Name, utils.MetricsInfluxDBTokenFlag.Name, utils.MetricsInfluxDBBucketFlag.Name)
 		} else if enableExportV2 && v1FlagIsSet {
-			utils.Fatalf("Flags --influxdb.metrics.username, --influxdb.metrics.password are only available for influxdb-v1")
+			utils.Fatalf("Flags --%s, --%s are only available for influxdb-v1", utils.MetricsInfluxDBUsernameFlag.Name, utils.MetricsInfluxDBPasswordFlag.Name)
 		}
 	}
 }

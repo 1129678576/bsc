@@ -23,12 +23,13 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
+	buildertypes "github.com/ethereum/go-ethereum/core/types/builder"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -96,11 +97,23 @@ func (ec *Client) BlockByHash(ctx context.Context, hash common.Hash) (*types.Blo
 	return ec.getBlock(ctx, "eth_getBlockByHash", hash, true)
 }
 
-// BlockByNumber returns a block from the current canonical chain. If number is nil, the
-// latest known block is returned.
+// BlockByNumber returns a block from the current canonical chain.
+// If `number` is nil, the latest known block is returned.
 //
-// Note that loading full blocks requires two requests. Use HeaderByNumber
-// if you don't need all transactions or uncle headers.
+// Use `HeaderByNumber` if you don't need full transaction data or uncle headers.
+//
+// Supported special block number tags:
+// - `earliest`  : The genesis (earliest) block
+// - `latest`    : The most recently included block
+// - `safe`      : The latest safe head block
+// - `finalized` : The latest finalized block
+// - `pending`   : The pending block
+//
+// Example usage:
+//
+// ```go
+// BlockByNumber(context.Background(), big.NewInt(int64(rpc.LatestBlockNumber)))
+// ```
 func (ec *Client) BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error) {
 	return ec.getBlock(ctx, "eth_getBlockByNumber", toBlockNumArg(number), true)
 }
@@ -122,7 +135,7 @@ func (ec *Client) PeerCount(ctx context.Context) (uint64, error) {
 // BlockReceipts returns the receipts of a given block number or hash.
 func (ec *Client) BlockReceipts(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) ([]*types.Receipt, error) {
 	var r []*types.Receipt
-	err := ec.c.CallContext(ctx, &r, "eth_getBlockReceipts", blockNrOrHash.String())
+	err := ec.c.CallContext(ctx, &r, "eth_getBlockReceipts", blockNrOrHash)
 	if err == nil && r == nil {
 		return nil, ethereum.NotFound
 	}
@@ -150,7 +163,7 @@ func (ec *Client) BlobSidecarByTxHash(ctx context.Context, hash common.Hash) (*t
 }
 
 type rpcBlock struct {
-	Hash         common.Hash         `json:"hash"`
+	Hash         *common.Hash        `json:"hash"`
 	Transactions []rpcTransaction    `json:"transactions"`
 	UncleHashes  []common.Hash       `json:"uncles"`
 	Withdrawals  []*types.Withdrawal `json:"withdrawals,omitempty"`
@@ -177,6 +190,12 @@ func (ec *Client) getBlock(ctx context.Context, method string, args ...interface
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil, err
 	}
+	// Pending blocks don't return a block hash, compute it for sender caching.
+	if body.Hash == nil {
+		tmp := head.Hash()
+		body.Hash = &tmp
+	}
+
 	// Quick-verify transaction and uncle lists. This mostly helps with debugging the server.
 	if head.UncleHash == types.EmptyUncleHash && len(body.UncleHashes) > 0 {
 		return nil, errors.New("server returned non-empty uncle list but block header indicates no uncles")
@@ -218,7 +237,7 @@ func (ec *Client) getBlock(ctx context.Context, method string, args ...interface
 	txs := make([]*types.Transaction, len(body.Transactions))
 	for i, tx := range body.Transactions {
 		if tx.From != nil {
-			setSenderFromServer(tx.tx, *tx.From, body.Hash)
+			setSenderFromServer(tx.tx, *tx.From, *body.Hash)
 		}
 		txs[i] = tx.tx
 	}
@@ -241,8 +260,21 @@ func (ec *Client) HeaderByHash(ctx context.Context, hash common.Hash) (*types.He
 	return head, err
 }
 
-// HeaderByNumber returns a block header from the current canonical chain. If number is
-// nil, the latest known header is returned.
+// HeaderByNumber returns a block header from the current canonical chain.
+// If `number` is nil, the latest known block header is returned.
+//
+// Supported special block number tags:
+// - `earliest`  : The genesis (earliest) block
+// - `latest`    : The most recently included block
+// - `safe`      : The latest safe head block
+// - `finalized` : The latest finalized block
+// - `pending`   : The pending block
+//
+// Example usage:
+//
+// ```go
+// HeaderByNumber(context.Background(), big.NewInt(int64(rpc.LatestBlockNumber)))
+// ```
 func (ec *Client) HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error) {
 	var head *types.Header
 	err := ec.c.CallContext(ctx, &head, "eth_getBlockByNumber", toBlockNumArg(number), false)
@@ -252,7 +284,7 @@ func (ec *Client) HeaderByNumber(ctx context.Context, number *big.Int) (*types.H
 	return head, err
 }
 
-// GetFinalizedHeader returns the requested finalized block header.
+// FinalizedHeader returns the requested finalized block header.
 func (ec *Client) FinalizedHeader(ctx context.Context, verifiedValidatorNum int64) (*types.Header, error) {
 	var head *types.Header
 	err := ec.c.CallContext(ctx, &head, "eth_getFinalizedHeader", verifiedValidatorNum)
@@ -262,15 +294,9 @@ func (ec *Client) FinalizedHeader(ctx context.Context, verifiedValidatorNum int6
 	return head, err
 }
 
-// GetFinalizedBlock returns the requested finalized block.
+// FinalizedBlock returns the requested finalized block.
 func (ec *Client) FinalizedBlock(ctx context.Context, verifiedValidatorNum int64, fullTx bool) (*types.Block, error) {
 	return ec.getBlock(ctx, "eth_getFinalizedBlock", verifiedValidatorNum, fullTx)
-}
-
-func (ec *Client) GetRootByDiffHash(ctx context.Context, blockNr *big.Int, blockHash common.Hash, diffHash common.Hash) (*core.VerifyResult, error) {
-	var result core.VerifyResult
-	err := ec.c.CallContext(ctx, &result, "eth_getRootByDiffHash", toBlockNumArg(blockNr), blockHash, diffHash)
-	return &result, err
 }
 
 type rpcTransaction struct {
@@ -407,6 +433,15 @@ func (ec *Client) TransactionReceipt(ctx context.Context, txHash common.Hash) (*
 		return nil, ethereum.NotFound
 	}
 	return r, err
+}
+
+// SubscribeTransactionReceipts subscribes to notifications about transaction receipts.
+func (ec *Client) SubscribeTransactionReceipts(ctx context.Context, q *ethereum.TransactionReceiptsQuery, ch chan<- []*types.Receipt) (ethereum.Subscription, error) {
+	sub, err := ec.c.EthSubscribe(ctx, ch, "transactionReceipts", q)
+	if err != nil {
+		return nil, err
+	}
+	return sub, nil
 }
 
 // SyncProgress retrieves the current progress of the sync algorithm. If there's
@@ -557,9 +592,16 @@ func (ec *Client) SubscribeFilterLogs(ctx context.Context, q ethereum.FilterQuer
 }
 
 func toFilterArg(q ethereum.FilterQuery) (interface{}, error) {
-	arg := map[string]interface{}{
-		"address": q.Addresses,
-		"topics":  q.Topics,
+	arg := map[string]interface{}{}
+	// Only include "address" when there are actual address filters.
+	// An empty slice is treated the same as nil (no filter), and omitting
+	// the field avoids sending "address":[] to nodes that reject empty arrays
+	// (e.g. Hedera, some non-Geth implementations).
+	if len(q.Addresses) > 0 {
+		arg["address"] = q.Addresses
+	}
+	if q.Topics != nil {
+		arg["topics"] = q.Topics
 	}
 	if q.BlockHash != nil {
 		arg["blockHash"] = *q.BlockHash
@@ -674,6 +716,15 @@ func (ec *Client) SuggestGasTipCap(ctx context.Context) (*big.Int, error) {
 	return (*big.Int)(&hex), nil
 }
 
+// BlobBaseFee retrieves the current blob base fee.
+func (ec *Client) BlobBaseFee(ctx context.Context) (*big.Int, error) {
+	var hex hexutil.Big
+	if err := ec.c.CallContext(ctx, &hex, "eth_blobBaseFee"); err != nil {
+		return nil, err
+	}
+	return (*big.Int)(&hex), nil
+}
+
 type feeHistoryResultMarshaling struct {
 	OldestBlock  *hexutil.Big     `json:"oldestBlock"`
 	Reward       [][]*hexutil.Big `json:"reward,omitempty"`
@@ -708,12 +759,38 @@ func (ec *Client) FeeHistory(ctx context.Context, blockCount uint64, lastBlock *
 }
 
 // EstimateGas tries to estimate the gas needed to execute a specific transaction based on
-// the current pending state of the backend blockchain. There is no guarantee that this is
-// the true gas limit requirement as other transactions may be added or removed by miners,
-// but it should provide a basis for setting a reasonable default.
+// the current state of the backend blockchain. There is no guarantee that this is the
+// true gas limit requirement as other transactions may be added or removed by miners, but
+// it should provide a basis for setting a reasonable default.
+//
+// Note that the state used by this method is implementation-defined by the remote RPC
+// server, but it's reasonable to assume that it will either be the pending or latest
+// state.
 func (ec *Client) EstimateGas(ctx context.Context, msg ethereum.CallMsg) (uint64, error) {
 	var hex hexutil.Uint64
 	err := ec.c.CallContext(ctx, &hex, "eth_estimateGas", toCallArg(msg))
+	if err != nil {
+		return 0, err
+	}
+	return uint64(hex), nil
+}
+
+// EstimateGasAtBlock is almost the same as EstimateGas except that it selects the block height
+// instead of using the remote RPC's default state for gas estimation.
+func (ec *Client) EstimateGasAtBlock(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int) (uint64, error) {
+	var hex hexutil.Uint64
+	err := ec.c.CallContext(ctx, &hex, "eth_estimateGas", toCallArg(msg), toBlockNumArg(blockNumber))
+	if err != nil {
+		return 0, err
+	}
+	return uint64(hex), nil
+}
+
+// EstimateGasAtBlockHash is almost the same as EstimateGas except that it selects the block
+// hash instead of using the remote RPC's default state for gas estimation.
+func (ec *Client) EstimateGasAtBlockHash(ctx context.Context, msg ethereum.CallMsg, blockHash common.Hash) (uint64, error) {
+	var hex hexutil.Uint64
+	err := ec.c.CallContext(ctx, &hex, "eth_estimateGas", toCallArg(msg), rpc.BlockNumberOrHashWithHash(blockHash, false))
 	if err != nil {
 		return 0, err
 	}
@@ -730,6 +807,41 @@ func (ec *Client) SendTransaction(ctx context.Context, tx *types.Transaction) er
 		return err
 	}
 	return ec.c.CallContext(ctx, nil, "eth_sendRawTransaction", hexutil.Encode(data))
+}
+
+// SendTransactionSync submits a signed tx and waits for a receipt (or until
+// the optional timeout elapses on the server side). If timeout == 0, the server
+// uses its default.
+func (ec *Client) SendTransactionSync(
+	ctx context.Context,
+	tx *types.Transaction,
+	timeout *time.Duration,
+) (*types.Receipt, error) {
+	raw, err := tx.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return ec.SendRawTransactionSync(ctx, raw, timeout)
+}
+
+func (ec *Client) SendRawTransactionSync(
+	ctx context.Context,
+	rawTx []byte,
+	timeout *time.Duration,
+) (*types.Receipt, error) {
+	var ms *uint64
+	if timeout != nil {
+		msInt := timeout.Milliseconds()
+		if msInt > 0 {
+			d := uint64(msInt)
+			ms = &d
+		}
+	}
+	var receipt types.Receipt
+	if err := ec.c.CallContext(ctx, &receipt, "eth_sendRawTransactionSync", hexutil.Bytes(rawTx), ms); err != nil {
+		return nil, err
+	}
+	return &receipt, nil
 }
 
 // SendTransactionConditional injects a signed transaction into the pending pool for execution.
@@ -759,13 +871,43 @@ func (ec *Client) HasBuilder(ctx context.Context, address common.Address) (bool,
 }
 
 // SendBid sends a bid
-func (ec *Client) SendBid(ctx context.Context, args types.BidArgs) (common.Hash, error) {
+func (ec *Client) SendBid(ctx context.Context, args buildertypes.BidArgs) (common.Hash, error) {
 	var hash common.Hash
 	err := ec.c.CallContext(ctx, &hash, "mev_sendBid", args)
 	if err != nil {
 		return common.Hash{}, err
 	}
 	return hash, nil
+}
+
+// SendBidBlock sends a BidBlock (zero-simulate MEV path).
+func (ec *Client) SendBidBlock(ctx context.Context, args buildertypes.BidBlockArgs) (common.Hash, error) {
+	var hash common.Hash
+	err := ec.c.CallContext(ctx, &hash, "mev_sendBidBlock", args)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	return hash, nil
+}
+
+// BidBlockPermission is the result of mev_getBidBlockPermission.
+type BidBlockPermission struct {
+	Allowed     bool            `json:"allowed"`
+	Reason      string          `json:"reason,omitempty"`
+	BlockHash   *common.Hash    `json:"blockHash,omitempty"`
+	BlockNumber *hexutil.Uint64 `json:"blockNumber,omitempty"`
+	RevokedAt   *time.Time      `json:"revokedAt,omitempty"`
+	ResetAt     time.Time       `json:"resetAt"`
+}
+
+// GetBidBlockPermission queries the builder's current BidBlock permission status.
+func (ec *Client) GetBidBlockPermission(ctx context.Context, builder common.Address) (*BidBlockPermission, error) {
+	var result BidBlockPermission
+	err := ec.c.CallContext(ctx, &result, "mev_getBidBlockPermission", builder)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // BestBidGasFee returns the gas fee of the best bid for the given parent hash.
@@ -779,8 +921,8 @@ func (ec *Client) BestBidGasFee(ctx context.Context, parentHash common.Hash) (*b
 }
 
 // MevParams returns the static params of mev
-func (ec *Client) MevParams(ctx context.Context) (*types.MevParams, error) {
-	var params types.MevParams
+func (ec *Client) MevParams(ctx context.Context) (*buildertypes.MevParams, error) {
+	var params buildertypes.MevParams
 	err := ec.c.CallContext(ctx, &params, "mev_params")
 	if err != nil {
 		return nil, err
@@ -852,6 +994,9 @@ func toCallArg(msg ethereum.CallMsg) interface{} {
 	if msg.BlobHashes != nil {
 		arg["blobVersionedHashes"] = msg.BlobHashes
 	}
+	if msg.AuthorizationList != nil {
+		arg["authorizationList"] = msg.AuthorizationList
+	}
 	return arg
 }
 
@@ -878,6 +1023,8 @@ type rpcProgress struct {
 	HealingBytecode        hexutil.Uint64
 	TxIndexFinishedBlocks  hexutil.Uint64
 	TxIndexRemainingBlocks hexutil.Uint64
+	StateIndexRemaining    hexutil.Uint64
+	TrienodeIndexRemaining hexutil.Uint64
 }
 
 func (p *rpcProgress) toSyncProgress() *ethereum.SyncProgress {
@@ -904,5 +1051,95 @@ func (p *rpcProgress) toSyncProgress() *ethereum.SyncProgress {
 		HealingBytecode:        uint64(p.HealingBytecode),
 		TxIndexFinishedBlocks:  uint64(p.TxIndexFinishedBlocks),
 		TxIndexRemainingBlocks: uint64(p.TxIndexRemainingBlocks),
+		StateIndexRemaining:    uint64(p.StateIndexRemaining),
+		TrienodeIndexRemaining: uint64(p.TrienodeIndexRemaining),
 	}
+}
+
+// SimulateOptions represents the options for eth_simulateV1.
+type SimulateOptions struct {
+	BlockStateCalls        []SimulateBlock `json:"blockStateCalls"`
+	TraceTransfers         bool            `json:"traceTransfers"`
+	Validation             bool            `json:"validation"`
+	ReturnFullTransactions bool            `json:"returnFullTransactions"`
+}
+
+// SimulateBlock represents a batch of calls to be simulated.
+type SimulateBlock struct {
+	BlockOverrides *ethereum.BlockOverrides                    `json:"blockOverrides,omitempty"`
+	StateOverrides map[common.Address]ethereum.OverrideAccount `json:"stateOverrides,omitempty"`
+	Calls          []ethereum.CallMsg                          `json:"calls"`
+}
+
+// MarshalJSON implements json.Marshaler for SimulateBlock.
+func (s SimulateBlock) MarshalJSON() ([]byte, error) {
+	type Alias struct {
+		BlockOverrides *ethereum.BlockOverrides                    `json:"blockOverrides,omitempty"`
+		StateOverrides map[common.Address]ethereum.OverrideAccount `json:"stateOverrides,omitempty"`
+		Calls          []interface{}                               `json:"calls"`
+	}
+	calls := make([]interface{}, len(s.Calls))
+	for i, call := range s.Calls {
+		calls[i] = toCallArg(call)
+	}
+	return json.Marshal(Alias{
+		BlockOverrides: s.BlockOverrides,
+		StateOverrides: s.StateOverrides,
+		Calls:          calls,
+	})
+}
+
+//go:generate go run github.com/fjl/gencodec -type SimulateCallResult -field-override simulateCallResultMarshaling -out gen_simulate_call_result.go
+
+// SimulateCallResult is the result of a simulated call.
+type SimulateCallResult struct {
+	ReturnValue []byte       `json:"returnData"`
+	Logs        []*types.Log `json:"logs"`
+	GasUsed     uint64       `json:"gasUsed"`
+	MaxUsedGas  uint64       `json:"maxUsedGas"`
+	Status      uint64       `json:"status"`
+	Error       *CallError   `json:"error,omitempty"`
+}
+
+type simulateCallResultMarshaling struct {
+	ReturnValue hexutil.Bytes
+	GasUsed     hexutil.Uint64
+	MaxUsedGas  hexutil.Uint64
+	Status      hexutil.Uint64
+}
+
+// CallError represents an error from a simulated call.
+type CallError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    string `json:"data,omitempty"`
+}
+
+//go:generate go run github.com/fjl/gencodec -type SimulateBlockResult -field-override simulateBlockResultMarshaling -out gen_simulate_block_result.go
+
+// SimulateBlockResult represents the result of a simulated block.
+type SimulateBlockResult struct {
+	Number        *big.Int             `json:"number"`
+	Hash          common.Hash          `json:"hash"`
+	Timestamp     uint64               `json:"timestamp"`
+	GasLimit      uint64               `json:"gasLimit"`
+	GasUsed       uint64               `json:"gasUsed"`
+	FeeRecipient  common.Address       `json:"miner"`
+	BaseFeePerGas *big.Int             `json:"baseFeePerGas,omitempty"`
+	Calls         []SimulateCallResult `json:"calls"`
+}
+
+type simulateBlockResultMarshaling struct {
+	Number        *hexutil.Big
+	Timestamp     hexutil.Uint64
+	GasLimit      hexutil.Uint64
+	GasUsed       hexutil.Uint64
+	BaseFeePerGas *hexutil.Big
+}
+
+// SimulateV1 executes transactions on top of a base state.
+func (ec *Client) SimulateV1(ctx context.Context, opts SimulateOptions, blockNrOrHash *rpc.BlockNumberOrHash) ([]SimulateBlockResult, error) {
+	var result []SimulateBlockResult
+	err := ec.c.CallContext(ctx, &result, "eth_simulateV1", opts, blockNrOrHash)
+	return result, err
 }

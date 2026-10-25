@@ -18,13 +18,13 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
-	"strings"
+	"sort"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
@@ -36,17 +36,10 @@ import (
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/eth/ethconfig"
-	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/metrics"
-	"github.com/ethereum/go-ethereum/node"
-	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
-	"github.com/ethereum/go-ethereum/triedb/pathdb"
-	"github.com/prometheus/tsdb/fileutil"
 	"github.com/urfave/cli/v2"
 )
 
@@ -78,30 +71,6 @@ WARNING: it's only supported in hash mode(--state.scheme=hash)".
 `,
 			},
 			{
-				Name:     "prune-block",
-				Usage:    "Prune block data offline",
-				Action:   pruneBlock,
-				Category: "MISCELLANEOUS COMMANDS",
-				Flags: []cli.Flag{
-					utils.DataDirFlag,
-					utils.AncientFlag,
-					utils.BlockAmountReserved,
-					utils.TriesInMemoryFlag,
-					utils.CheckSnapshotWithMPT,
-				},
-				Description: `
-geth offline prune-block for block data in ancientdb.
-The amount of blocks expected for remaining after prune can be specified via block-amount-reserved in this command,
-will prune and only remain the specified amount of old block data in ancientdb.
-the brief workflow is to backup the number of this specified amount blocks backward in original ancientdb
-into new ancient_backup, then delete the original ancientdb dir and rename the ancient_backup to original one for replacement,
-finally assemble the statedb and new ancientDb together.
-The purpose of doing it is because the block data will be moved into the ancient store when it
-becomes old enough(exceed the Threshold 90000), the disk usage will be very large over time, and is occupied mainly by ancientDb,
-so it's very necessary to do block data prune, this feature will handle it.
-`,
-			},
-			{
 				Name:      "verify-state",
 				Usage:     "Recalculate state hash based on the snapshot for verification",
 				ArgsUsage: "<root>",
@@ -112,29 +81,6 @@ geth snapshot verify-state <state-root>
 will traverse the whole accounts and storages set based on the specified
 snapshot and recalculate the root hash of state for verification.
 In other words, this command does the snapshot to trie conversion.
-`,
-			},
-			{
-				Name: "insecure-prune-all",
-				Usage: "Prune all trie state data except genesis block, it will break storage for fullnode, only suitable for fast node " +
-					"who do not need trie storage at all",
-				ArgsUsage: "<genesisPath>",
-				Action:    pruneAllState,
-				Category:  "MISCELLANEOUS COMMANDS",
-				Flags: []cli.Flag{
-					utils.DataDirFlag,
-					utils.AncientFlag,
-				},
-				Description: `
-will prune all historical trie state data except genesis block.
-All trie nodes will be deleted from the database. 
-
-It expects the genesis file as argument.
-
-WARNING: It's necessary to delete the trie clean cache after the pruning.
-If you specify another directory for the trie clean cache via "--cache.trie.journal"
-during the use of Geth, please also specify it here for correct deletion. Otherwise
-the trie clean cache with default directory will be deleted.
 `,
 			},
 			{
@@ -164,7 +110,9 @@ information about the specified address.
 				Usage:     "Traverse the state with given root hash and perform quick verification",
 				ArgsUsage: "<root>",
 				Action:    traverseState,
-				Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
+				Flags: slices.Concat([]cli.Flag{
+					utils.AccountFlag,
+				}, utils.NetworkFlags, utils.DatabaseFlags),
 				Description: `
 geth snapshot traverse-state <state-root>
 will traverse the whole state from the given state root and will abort if any
@@ -172,6 +120,8 @@ referenced trie node or contract code is missing. This command can be used for
 state integrity verification. The default checking target is the HEAD state.
 
 It's also usable without snapshot enabled.
+
+If --account is specified, only the storage trie of that account is traversed.
 `,
 			},
 			{
@@ -179,7 +129,9 @@ It's also usable without snapshot enabled.
 				Usage:     "Traverse the state with given root hash and perform detailed verification",
 				ArgsUsage: "<root>",
 				Action:    traverseRawState,
-				Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
+				Flags: slices.Concat([]cli.Flag{
+					utils.AccountFlag,
+				}, utils.NetworkFlags, utils.DatabaseFlags),
 				Description: `
 geth snapshot traverse-rawstate <state-root>
 will traverse the whole state from the given root and will abort if any referenced
@@ -188,6 +140,8 @@ verification. The default checking target is the HEAD state. It's basically iden
 to traverse-state, but the check granularity is smaller.
 
 It's also usable without snapshot enabled.
+
+If --account is specified, only the storage trie of that account is traversed.
 `,
 			},
 			{
@@ -221,233 +175,25 @@ The export-preimages command exports hash preimages to a flat file, in exactly
 the expected order for the overlay tree migration.
 `,
 			},
+			{
+				Name:    "list-eip-7610-accounts",
+				Aliases: []string{"eip7610"},
+				Usage:   "list EIP7610 eligible accounts",
+				Action:  listEIP7610EligibleAccounts,
+				Flags:   slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
+				Description: `
+geth snapshot list-eip-7610-accounts
+traverses the post–EIP-161 state and returns all accounts that are eligible
+under EIP-7610: accounts with zero nonce, empty runtime code, and non-empty
+storage. The traversal will be aborted immediately if the state is prior to
+EIP-161.
+
+The exported accounts are identified by their address.
+`,
+			},
 		},
 	}
 )
-
-func accessDb(ctx *cli.Context, stack *node.Node) (ethdb.Database, error) {
-	//The layer of tries trees that keep in memory.
-	TriesInMemory := int(ctx.Uint64(utils.TriesInMemoryFlag.Name))
-	chaindb := utils.MakeChainDatabase(ctx, stack, false, true)
-	defer chaindb.Close()
-
-	if !ctx.Bool(utils.CheckSnapshotWithMPT.Name) {
-		return chaindb, nil
-	}
-	headBlock := rawdb.ReadHeadBlock(chaindb)
-	if headBlock == nil {
-		return nil, errors.New("failed to load head block")
-	}
-	headHeader := headBlock.Header()
-	//Make sure the MPT and snapshot matches before pruning, otherwise the node can not start.
-	snapconfig := snapshot.Config{
-		CacheSize:  256,
-		Recovery:   false,
-		NoBuild:    true,
-		AsyncBuild: false,
-	}
-	dbScheme := rawdb.ReadStateScheme(chaindb)
-	var config *triedb.Config
-	if dbScheme == rawdb.PathScheme {
-		config = &triedb.Config{
-			PathDB: utils.PathDBConfigAddJournalFilePath(stack, pathdb.ReadOnly),
-		}
-	} else if dbScheme == rawdb.HashScheme {
-		config = triedb.HashDefaults
-	}
-	snaptree, err := snapshot.New(snapconfig, chaindb, triedb.NewDatabase(chaindb, config), headBlock.Root(), TriesInMemory, false)
-	if err != nil {
-		log.Error("snaptree error", "err", err)
-		return nil, err // The relevant snapshot(s) might not exist
-	}
-
-	// Use the HEAD-(n-1) as the target root. The reason for picking it is:
-	// - in most of the normal cases, the related state is available
-	// - the probability of this layer being reorg is very low
-
-	// Retrieve all snapshot layers from the current HEAD.
-	// In theory there are n difflayers + 1 disk layer present,
-	// so n diff layers are expected to be returned.
-	layers := snaptree.Snapshots(headHeader.Root, TriesInMemory, true)
-	if len(layers) != TriesInMemory {
-		// Reject if the accumulated diff layers are less than n. It
-		// means in most of normal cases, there is no associated state
-		// with bottom-most diff layer.
-		log.Error("snapshot layers != TriesInMemory", "err", err)
-		return nil, fmt.Errorf("snapshot not old enough yet: need %d more blocks", TriesInMemory-len(layers))
-	}
-	// Use the bottom-most diff layer as the target
-	targetRoot := layers[len(layers)-1].Root()
-
-	// Ensure the root is really present. The weak assumption
-	// is the presence of root can indicate the presence of the
-	// entire trie.
-	if blob := rawdb.ReadLegacyTrieNode(chaindb, targetRoot); len(blob) == 0 {
-		// The special case is for clique based networks(rinkeby, goerli
-		// and some other private networks), it's possible that two
-		// consecutive blocks will have same root. In this case snapshot
-		// difflayer won't be created. So HEAD-(n-1) may not paired with
-		// head-(n-1) layer. Instead the paired layer is higher than the
-		// bottom-most diff layer. Try to find the bottom-most snapshot
-		// layer with state available.
-		//
-		// Note HEAD is ignored. Usually there is the associated
-		// state available, but we don't want to use the topmost state
-		// as the pruning target.
-		var found bool
-		for i := len(layers) - 2; i >= 1; i-- {
-			if blob := rawdb.ReadLegacyTrieNode(chaindb, layers[i].Root()); len(blob) != 0 {
-				targetRoot = layers[i].Root()
-				found = true
-				log.Info("Selecting middle-layer as the pruning target", "root", targetRoot, "depth", i)
-				break
-			}
-		}
-		if !found {
-			if blob := rawdb.ReadLegacyTrieNode(chaindb, snaptree.DiskRoot()); len(blob) != 0 {
-				targetRoot = snaptree.DiskRoot()
-				found = true
-				log.Info("Selecting disk-layer as the pruning target", "root", targetRoot)
-			}
-		}
-		if !found {
-			if len(layers) > 0 {
-				log.Error("no snapshot paired state")
-				return nil, errors.New("no snapshot paired state")
-			}
-			return nil, fmt.Errorf("associated state[%x] is not present", targetRoot)
-		}
-	} else {
-		if len(layers) > 0 {
-			log.Info("Selecting bottom-most difflayer as the pruning target", "root", targetRoot, "height", headHeader.Number.Uint64()-uint64(len(layers)-1))
-		} else {
-			log.Info("Selecting user-specified state as the pruning target", "root", targetRoot)
-		}
-	}
-	return chaindb, nil
-}
-
-func pruneBlock(ctx *cli.Context) error {
-	var (
-		stack   *node.Node
-		config  gethConfig
-		chaindb ethdb.Database
-		err     error
-
-		oldAncientPath      string
-		newAncientPath      string
-		blockAmountReserved uint64
-		blockpruner         *pruner.BlockPruner
-	)
-
-	stack, config = makeConfigNode(ctx)
-	defer stack.Close()
-	blockAmountReserved = ctx.Uint64(utils.BlockAmountReserved.Name)
-	if blockAmountReserved < params.FullImmutabilityThreshold {
-		return fmt.Errorf("block-amount-reserved must be greater than or equal to %d", params.FullImmutabilityThreshold)
-	}
-	chaindb, err = accessDb(ctx, stack)
-	if err != nil {
-		return err
-	}
-
-	// Most of the problems reported by users when first using the prune-block
-	// tool are due to incorrect directory settings.Here, the default directory
-	// and relative directory are canceled, and the user is forced to formulate
-	// an absolute path to guide users to run the prune-block command correctly.
-	if !ctx.IsSet(utils.DataDirFlag.Name) {
-		return errors.New("datadir must be set")
-	} else {
-		datadir := ctx.String(utils.DataDirFlag.Name)
-		if !filepath.IsAbs(datadir) {
-			// force absolute paths, which often fail due to the splicing of relative paths
-			return errors.New("datadir not abs path")
-		}
-	}
-
-	if !ctx.IsSet(utils.AncientFlag.Name) {
-		return errors.New("datadir.ancient must be set")
-	} else {
-		if stack.CheckIfMultiDataBase() {
-			ancientPath := ctx.String(utils.AncientFlag.Name)
-			index := strings.LastIndex(ancientPath, "/ancient/chain")
-			if index != -1 {
-				oldAncientPath = ancientPath[:index] + "/block/ancient/chain"
-			}
-		} else {
-			oldAncientPath = ctx.String(utils.AncientFlag.Name)
-		}
-		if !filepath.IsAbs(oldAncientPath) {
-			// force absolute paths, which often fail due to the splicing of relative paths
-			return errors.New("datadir.ancient not abs path")
-		}
-	}
-
-	path, _ := filepath.Split(oldAncientPath)
-	if path == "" {
-		return errors.New("prune failed, did not specify the AncientPath")
-	}
-	newVersionPath := false
-	files, err := os.ReadDir(oldAncientPath)
-	if err != nil {
-		return err
-	}
-	for _, file := range files {
-		if file.IsDir() && file.Name() == "chain" {
-			newVersionPath = true
-		}
-	}
-	if newVersionPath && !strings.HasSuffix(oldAncientPath, "geth/chaindata/ancient/chain") {
-		log.Error("datadir.ancient subdirectory incorrect", "got path", oldAncientPath, "want subdirectory", "geth/chaindata/ancient/chain/")
-		return errors.New("datadir.ancient subdirectory incorrect")
-	}
-	newAncientPath = filepath.Join(path, "chain_back")
-
-	blockpruner = pruner.NewBlockPruner(chaindb, stack, oldAncientPath, newAncientPath, blockAmountReserved)
-
-	lock, exist, err := fileutil.Flock(filepath.Join(oldAncientPath, "PRUNEFLOCK"))
-	if err != nil {
-		log.Error("file lock error", "err", err)
-		return err
-	}
-	if exist {
-		defer lock.Release()
-		log.Info("file lock existed, waiting for prune recovery and continue", "err", err)
-		if err := blockpruner.RecoverInterruption("chaindata", config.Eth.DatabaseCache, utils.MakeDatabaseHandles(0), "", false); err != nil {
-			log.Error("Pruning failed", "err", err)
-			return err
-		}
-		log.Info("Block prune successfully")
-		return nil
-	}
-
-	if _, err := os.Stat(newAncientPath); err == nil {
-		// No file lock found for old ancientDB but new ancientDB existed, indicating the geth was interrupted
-		// after old ancientDB removal, this happened after backup successfully, so just rename the new ancientDB
-		if err := blockpruner.AncientDbReplacer(); err != nil {
-			log.Error("Failed to rename new ancient directory")
-			return err
-		}
-		log.Info("Block prune successfully")
-		return nil
-	}
-	name := "chaindata"
-	if err := blockpruner.BlockPruneBackUp(name, config.Eth.DatabaseCache, utils.MakeDatabaseHandles(0), "", false, false); err != nil {
-		log.Error("Failed to back up block", "err", err)
-		return err
-	}
-
-	log.Info("backup block successfully")
-
-	//After backing up successfully, rename the new ancientdb name to the original one, and delete the old ancientdb
-	if err := blockpruner.AncientDbReplacer(); err != nil {
-		return err
-	}
-
-	lock.Release()
-	log.Info("Block prune successfully")
-	return nil
-}
 
 // Deprecation: this command should be deprecated once the hash-based
 // scheme is deprecated.
@@ -455,7 +201,7 @@ func pruneState(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	chaindb := utils.MakeChainDatabase(ctx, stack, false, false)
+	chaindb := utils.MakeChainDatabase(ctx, stack, false)
 	defer chaindb.Close()
 
 	prunerconfig := pruner.Config{
@@ -491,54 +237,11 @@ func pruneState(ctx *cli.Context) error {
 	return nil
 }
 
-func pruneAllState(ctx *cli.Context) error {
-	stack, _ := makeConfigNode(ctx)
-	defer stack.Close()
-
-	genesisPath := ctx.Args().First()
-	if len(genesisPath) == 0 {
-		utils.Fatalf("Must supply path to genesis JSON file")
-	}
-	file, err := os.Open(genesisPath)
-	if err != nil {
-		utils.Fatalf("Failed to read genesis file: %v", err)
-	}
-	defer file.Close()
-
-	g := new(core.Genesis)
-	if err := json.NewDecoder(file).Decode(g); err != nil {
-		cfg := gethConfig{
-			Eth:     ethconfig.Defaults,
-			Node:    defaultNodeConfig(),
-			Metrics: metrics.DefaultConfig,
-		}
-
-		// Load config file.
-		if err := loadConfig(genesisPath, &cfg); err != nil {
-			utils.Fatalf("%v", err)
-		}
-		g = cfg.Eth.Genesis
-	}
-
-	chaindb := utils.MakeChainDatabase(ctx, stack, false, false)
-	defer chaindb.Close()
-	pruner, err := pruner.NewAllPruner(chaindb)
-	if err != nil {
-		log.Error("Failed to open snapshot tree", "err", err)
-		return err
-	}
-	if err = pruner.PruneAll(g); err != nil {
-		log.Error("Failed to prune state", "err", err)
-		return err
-	}
-	return nil
-}
-
 func verifyState(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	chaindb := utils.MakeChainDatabase(ctx, stack, true, false)
+	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 	headBlock := rawdb.ReadHeadBlock(chaindb)
 	if headBlock == nil {
@@ -548,22 +251,10 @@ func verifyState(ctx *cli.Context) error {
 	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
 	defer triedb.Close()
 
-	snapConfig := snapshot.Config{
-		CacheSize:  256,
-		Recovery:   false,
-		NoBuild:    true,
-		AsyncBuild: false,
-	}
-	snaptree, err := snapshot.New(snapConfig, chaindb, triedb, headBlock.Root(), 128, false)
-	if err != nil {
-		log.Error("Failed to open snapshot tree", "err", err)
-		return err
-	}
-	if ctx.NArg() > 1 {
-		log.Error("Too many arguments given")
-		return errors.New("too many arguments")
-	}
-	var root = headBlock.Root()
+	var (
+		err  error
+		root = headBlock.Root()
+	)
 	if ctx.NArg() == 1 {
 		root, err = parseRoot(ctx.Args().First())
 		if err != nil {
@@ -571,12 +262,34 @@ func verifyState(ctx *cli.Context) error {
 			return err
 		}
 	}
-	if err := snaptree.Verify(root); err != nil {
-		log.Error("Failed to verify state", "root", root, "err", err)
-		return err
+	if triedb.Scheme() == rawdb.PathScheme {
+		if err := triedb.VerifyState(root); err != nil {
+			log.Error("Failed to verify state", "root", root, "err", err)
+			return err
+		}
+		log.Info("Verified the state", "root", root)
+
+		// TODO(rjl493456442) implement dangling checks in pathdb.
+		return nil
+	} else {
+		snapConfig := snapshot.Config{
+			CacheSize:  256,
+			Recovery:   false,
+			NoBuild:    true,
+			AsyncBuild: false,
+		}
+		snaptree, err := snapshot.New(snapConfig, chaindb, triedb, headBlock.Root(), 128, false)
+		if err != nil {
+			log.Error("Failed to open snapshot tree", "err", err)
+			return err
+		}
+		if err := snaptree.Verify(root); err != nil {
+			log.Error("Failed to verify state", "root", root, "err", err)
+			return err
+		}
+		log.Info("Verified the state", "root", root)
+		return snapshot.CheckDanglingStorage(chaindb)
 	}
-	log.Info("Verified the state", "root", root)
-	return snapshot.CheckDanglingStorage(chaindb)
 }
 
 // checkDanglingStorage iterates the snap storage data, and verifies that all
@@ -585,9 +298,123 @@ func checkDanglingStorage(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	db := utils.MakeChainDatabase(ctx, stack, true, false)
+	db := utils.MakeChainDatabase(ctx, stack, true)
 	defer db.Close()
 	return snapshot.CheckDanglingStorage(db)
+}
+
+// parseAccount parses the account flag value as either an address (20 bytes)
+// or an account hash (32 bytes) and returns the hashed account key.
+func parseAccount(input string) (common.Hash, error) {
+	switch len(input) {
+	case 40, 42: // address
+		return crypto.Keccak256Hash(common.HexToAddress(input).Bytes()), nil
+	case 64, 66: // hash
+		return common.HexToHash(input), nil
+	default:
+		return common.Hash{}, errors.New("malformed account address or hash")
+	}
+}
+
+// lookupAccount resolves the account from the state trie using the given
+// account hash.
+func lookupAccount(accountHash common.Hash, tr *trie.Trie) (*types.StateAccount, error) {
+	accData, err := tr.Get(accountHash.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get account %s: %w", accountHash, err)
+	}
+	if accData == nil {
+		return nil, fmt.Errorf("account not found: %s", accountHash)
+	}
+	var acc types.StateAccount
+	if err := rlp.DecodeBytes(accData, &acc); err != nil {
+		return nil, fmt.Errorf("invalid account data %s: %w", accountHash, err)
+	}
+	return &acc, nil
+}
+
+func traverseStorage(id *trie.ID, db *triedb.Database, report bool, detail bool) error {
+	tr, err := trie.NewStateTrie(id, db)
+	if err != nil {
+		log.Error("Failed to open storage trie", "account", id.Owner, "root", id.Root, "err", err)
+		return err
+	}
+	var (
+		slots      int
+		nodes      int
+		lastReport time.Time
+		start      = time.Now()
+	)
+	it, err := tr.NodeIterator(nil)
+	if err != nil {
+		log.Error("Failed to open storage iterator", "account", id.Owner, "root", id.Root, "err", err)
+		return err
+	}
+	logger := log.Debug
+	if report {
+		logger = log.Info
+	}
+	logger("Start traversing storage trie", "account", id.Owner, "storageRoot", id.Root)
+
+	if !detail {
+		iter := trie.NewIterator(it)
+		for iter.Next() {
+			slots += 1
+			if time.Since(lastReport) > time.Second*8 {
+				logger("Traversing storage", "account", id.Owner, "slots", slots, "elapsed", common.PrettyDuration(time.Since(start)))
+				lastReport = time.Now()
+			}
+		}
+		if iter.Err != nil {
+			log.Error("Failed to traverse storage trie", "root", id.Root, "err", iter.Err)
+			return iter.Err
+		}
+		logger("Storage is complete", "account", id.Owner, "slots", slots, "elapsed", common.PrettyDuration(time.Since(start)))
+	} else {
+		reader, err := db.NodeReader(id.StateRoot)
+		if err != nil {
+			log.Error("Failed to open state reader", "err", err)
+			return err
+		}
+		var (
+			buffer = make([]byte, 32)
+			hasher = crypto.NewKeccakState()
+		)
+		for it.Next(true) {
+			nodes += 1
+			node := it.Hash()
+
+			// Check the presence for non-empty hash node(embedded node doesn't
+			// have their own hash).
+			if node != (common.Hash{}) {
+				blob, _ := reader.Node(id.Owner, it.Path(), node)
+				if len(blob) == 0 {
+					log.Error("Missing trie node(storage)", "hash", node)
+					return errors.New("missing storage")
+				}
+				hasher.Reset()
+				hasher.Write(blob)
+				hasher.Read(buffer)
+				if !bytes.Equal(buffer, node.Bytes()) {
+					log.Error("Invalid trie node(storage)", "hash", node.Hex(), "value", blob)
+					return errors.New("invalid storage node")
+				}
+			}
+			if it.Leaf() {
+				slots += 1
+			}
+			if time.Since(lastReport) > time.Second*8 {
+				logger("Traversing storage", "account", id.Owner, "nodes", nodes, "slots", slots, "elapsed", common.PrettyDuration(time.Since(start)))
+				lastReport = time.Now()
+			}
+		}
+		if err := it.Error(); err != nil {
+			log.Error("Failed to traverse storage trie", "root", id.Root, "err", err)
+			return err
+		}
+		logger("Storage is complete", "account", id.Owner, "nodes", nodes, "slots", slots, "elapsed", common.PrettyDuration(time.Since(start)))
+	}
+	return nil
 }
 
 // traverseState is a helper function used for pruning verification.
@@ -597,7 +424,7 @@ func traverseState(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	chaindb := utils.MakeChainDatabase(ctx, stack, true, false)
+	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 
 	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
@@ -627,6 +454,30 @@ func traverseState(ctx *cli.Context) error {
 		root = headBlock.Root()
 		log.Info("Start traversing the state", "root", root, "number", headBlock.NumberU64())
 	}
+	// If --account is specified, only traverse the storage trie of that account.
+	if accountStr := ctx.String(utils.AccountFlag.Name); accountStr != "" {
+		accountHash, err := parseAccount(accountStr)
+		if err != nil {
+			log.Error("Failed to parse account", "err", err)
+			return err
+		}
+		// Use raw trie since the account key is already hashed.
+		t, err := trie.New(trie.StateTrieID(root), triedb)
+		if err != nil {
+			log.Error("Failed to open state trie", "root", root, "err", err)
+			return err
+		}
+		acc, err := lookupAccount(accountHash, t)
+		if err != nil {
+			log.Error("Failed to look up account", "hash", accountHash, "err", err)
+			return err
+		}
+		if acc.Root == types.EmptyRootHash {
+			log.Info("Account has no storage", "hash", accountHash)
+			return nil
+		}
+		return traverseStorage(trie.StorageTrieID(root, accountHash, acc.Root), triedb, true, false)
+	}
 	t, err := trie.NewStateTrie(trie.StateTrieID(root), triedb)
 	if err != nil {
 		log.Error("Failed to open trie", "root", root, "err", err)
@@ -653,29 +504,9 @@ func traverseState(ctx *cli.Context) error {
 			return err
 		}
 		if acc.Root != types.EmptyRootHash {
-			id := trie.StorageTrieID(root, common.BytesToHash(accIter.Key), acc.Root)
-			storageTrie, err := trie.NewStateTrie(id, triedb)
+			err := traverseStorage(trie.StorageTrieID(root, common.BytesToHash(accIter.Key), acc.Root), triedb, false, false)
 			if err != nil {
-				log.Error("Failed to open storage trie", "root", acc.Root, "err", err)
 				return err
-			}
-			storageIt, err := storageTrie.NodeIterator(nil)
-			if err != nil {
-				log.Error("Failed to open storage iterator", "root", acc.Root, "err", err)
-				return err
-			}
-			storageIter := trie.NewIterator(storageIt)
-			for storageIter.Next() {
-				slots += 1
-
-				if time.Since(lastReport) > time.Second*8 {
-					log.Info("Traversing state", "accounts", accounts, "slots", slots, "codes", codes, "elapsed", common.PrettyDuration(time.Since(start)))
-					lastReport = time.Now()
-				}
-			}
-			if storageIter.Err != nil {
-				log.Error("Failed to traverse storage trie", "root", acc.Root, "err", storageIter.Err)
-				return storageIter.Err
 			}
 		}
 		if !bytes.Equal(acc.CodeHash, types.EmptyCodeHash.Bytes()) {
@@ -706,7 +537,7 @@ func traverseRawState(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	chaindb := utils.MakeChainDatabase(ctx, stack, true, false)
+	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 
 	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
@@ -735,6 +566,30 @@ func traverseRawState(ctx *cli.Context) error {
 	} else {
 		root = headBlock.Root()
 		log.Info("Start traversing the state", "root", root, "number", headBlock.NumberU64())
+	}
+	// If --account is specified, only traverse the storage trie of that account.
+	if accountStr := ctx.String(utils.AccountFlag.Name); accountStr != "" {
+		accountHash, err := parseAccount(accountStr)
+		if err != nil {
+			log.Error("Failed to parse account", "err", err)
+			return err
+		}
+		// Use raw trie since the account key is already hashed.
+		t, err := trie.New(trie.StateTrieID(root), triedb)
+		if err != nil {
+			log.Error("Failed to open state trie", "root", root, "err", err)
+			return err
+		}
+		acc, err := lookupAccount(accountHash, t)
+		if err != nil {
+			log.Error("Failed to look up account", "hash", accountHash, "err", err)
+			return err
+		}
+		if acc.Root == types.EmptyRootHash {
+			log.Info("Account has no storage", "hash", accountHash)
+			return nil
+		}
+		return traverseStorage(trie.StorageTrieID(root, accountHash, acc.Root), triedb, true, true)
 	}
 	t, err := trie.NewStateTrie(trie.StateTrieID(root), triedb)
 	if err != nil {
@@ -791,49 +646,9 @@ func traverseRawState(ctx *cli.Context) error {
 				return errors.New("invalid account")
 			}
 			if acc.Root != types.EmptyRootHash {
-				id := trie.StorageTrieID(root, common.BytesToHash(accIter.LeafKey()), acc.Root)
-				storageTrie, err := trie.NewStateTrie(id, triedb)
+				err := traverseStorage(trie.StorageTrieID(root, common.BytesToHash(accIter.LeafKey()), acc.Root), triedb, false, true)
 				if err != nil {
-					log.Error("Failed to open storage trie", "root", acc.Root, "err", err)
-					return errors.New("missing storage trie")
-				}
-				storageIter, err := storageTrie.NodeIterator(nil)
-				if err != nil {
-					log.Error("Failed to open storage iterator", "root", acc.Root, "err", err)
 					return err
-				}
-				for storageIter.Next(true) {
-					nodes += 1
-					node := storageIter.Hash()
-
-					// Check the presence for non-empty hash node(embedded node doesn't
-					// have their own hash).
-					if node != (common.Hash{}) {
-						blob, _ := reader.Node(common.BytesToHash(accIter.LeafKey()), storageIter.Path(), node)
-						if len(blob) == 0 {
-							log.Error("Missing trie node(storage)", "hash", node)
-							return errors.New("missing storage")
-						}
-						hasher.Reset()
-						hasher.Write(blob)
-						hasher.Read(got)
-						if !bytes.Equal(got, node.Bytes()) {
-							log.Error("Invalid trie node(storage)", "hash", node.Hex(), "value", blob)
-							return errors.New("invalid storage node")
-						}
-					}
-					// Bump the counter if it's leaf node.
-					if storageIter.Leaf() {
-						slots += 1
-					}
-					if time.Since(lastReport) > time.Second*8 {
-						log.Info("Traversing state", "nodes", nodes, "accounts", accounts, "slots", slots, "codes", codes, "elapsed", common.PrettyDuration(time.Since(start)))
-						lastReport = time.Now()
-					}
-				}
-				if storageIter.Error() != nil {
-					log.Error("Failed to traverse storage trie", "root", acc.Root, "err", storageIter.Error())
-					return storageIter.Error()
 				}
 			}
 			if !bytes.Equal(acc.CodeHash, types.EmptyCodeHash.Bytes()) {
@@ -869,29 +684,21 @@ func dumpState(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	db := utils.MakeChainDatabase(ctx, stack, true, false)
+	db := utils.MakeChainDatabase(ctx, stack, true)
 	defer db.Close()
 
 	conf, root, err := parseDumpConfig(ctx, stack, db)
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 	triedb := utils.MakeTrieDatabase(ctx, stack, db, false, true, false)
 	defer triedb.Close()
 
-	snapConfig := snapshot.Config{
-		CacheSize:  256,
-		Recovery:   false,
-		NoBuild:    true,
-		AsyncBuild: false,
-	}
-	triesInMemory := ctx.Uint64(utils.TriesInMemoryFlag.Name)
-	snaptree, err := snapshot.New(snapConfig, db, triedb, root, int(triesInMemory), false)
+	stateIt, err := utils.NewStateIterator(triedb, db, root, int(ctx.Uint64(utils.TriesInMemoryFlag.Name)))
 	if err != nil {
 		return err
 	}
-	accIt, err := snaptree.AccountIterator(root, common.BytesToHash(conf.Start))
+	accIt, err := stateIt.AccountIterator(root, common.BytesToHash(conf.Start))
 	if err != nil {
 		return err
 	}
@@ -925,7 +732,7 @@ func dumpState(ctx *cli.Context) error {
 		if !conf.SkipStorage {
 			da.Storage = make(map[common.Hash]string)
 
-			stIt, err := snaptree.StorageIterator(root, accIt.Hash(), common.Hash{})
+			stIt, err := stateIt.StorageIterator(root, accIt.Hash(), common.Hash{})
 			if err != nil {
 				return err
 			}
@@ -957,7 +764,7 @@ func snapshotExportPreimages(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	chaindb := utils.MakeChainDatabase(ctx, stack, true, false)
+	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 
 	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
@@ -965,11 +772,11 @@ func snapshotExportPreimages(ctx *cli.Context) error {
 
 	var root common.Hash
 	if ctx.NArg() > 1 {
-		rootBytes := common.FromHex(ctx.Args().Get(1))
-		if len(rootBytes) != common.HashLength {
+		hash := ctx.Args().Get(1)
+		if !common.IsHexHash(hash) {
 			return fmt.Errorf("invalid hash: %s", ctx.Args().Get(1))
 		}
-		root = common.BytesToHash(rootBytes)
+		root = common.HexToHash(hash)
 	} else {
 		headBlock := rawdb.ReadHeadBlock(chaindb)
 		if headBlock == nil {
@@ -978,17 +785,11 @@ func snapshotExportPreimages(ctx *cli.Context) error {
 		}
 		root = headBlock.Root()
 	}
-	snapConfig := snapshot.Config{
-		CacheSize:  256,
-		Recovery:   false,
-		NoBuild:    true,
-		AsyncBuild: false,
-	}
-	snaptree, err := snapshot.New(snapConfig, chaindb, triedb, root, 128, false)
+	stateIt, err := utils.NewStateIterator(triedb, chaindb, root, int(ctx.Uint64(utils.TriesInMemoryFlag.Name)))
 	if err != nil {
 		return err
 	}
-	return utils.ExportSnapshotPreimages(chaindb, snaptree, ctx.Args().First(), root)
+	return utils.ExportSnapshotPreimages(chaindb, stateIt, ctx.Args().First(), root)
 }
 
 // checkAccount iterates the snap data layers, and looks up the given account
@@ -1012,7 +813,7 @@ func checkAccount(ctx *cli.Context) error {
 	}
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
-	chaindb := utils.MakeChainDatabase(ctx, stack, true, false)
+	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 	start := time.Now()
 	log.Info("Checking difflayer journal", "address", addr, "hash", hash)
@@ -1020,5 +821,94 @@ func checkAccount(ctx *cli.Context) error {
 		return err
 	}
 	log.Info("Checked the snapshot journalled storage", "time", common.PrettyDuration(time.Since(start)))
+	return nil
+}
+
+// listEIP7610EligibleAccounts traverses the post–EIP-161 state and returns all
+// accounts that are eligible under EIP-7610: accounts with zero nonce, empty
+// runtime code, and non-empty storage.
+//
+// Such accounts could only have been created before EIP-161, since after that
+// all newly created contracts are initialized with a nonce of one.
+//
+// This helper should be generally applicable to all networks, including the
+// Ethereum mainnet. For most networks where EIP-161 was enabled from genesis,
+// the resulting set is expected to be empty. Otherwise, network operators are
+// responsible for generating the eligible account set themselves.
+//
+// Notably, the exported accounts are identified by their address.
+func listEIP7610EligibleAccounts(ctx *cli.Context) error {
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	chaindb := utils.MakeChainDatabase(ctx, stack, true)
+	defer chaindb.Close()
+
+	headBlock := rawdb.ReadHeadBlock(chaindb)
+	if headBlock == nil {
+		log.Error("Failed to load head block")
+		return nil
+	}
+	config, _, err := core.LoadChainConfig(chaindb, utils.MakeGenesis(ctx))
+	if err != nil {
+		log.Error("Failed to load chain config", "err", err)
+		return err
+	}
+	if !config.IsEIP158(headBlock.Number()) {
+		log.Info("Local head is prior to EIP-161", "head", headBlock.Number(), "eip-161", *config.EIP158Block)
+		return nil
+	}
+	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
+	defer triedb.Close()
+
+	if triedb.Scheme() != rawdb.PathScheme {
+		log.Error("Hash scheme is not supported")
+		return nil
+	}
+	iter, err := triedb.AccountIterator(headBlock.Root(), common.Hash{})
+	if err != nil {
+		log.Error("Failed to get account iterator", "err", err)
+		return err
+	}
+	var (
+		start    = time.Now()
+		accounts []common.Address
+	)
+	for iter.Next() {
+		blob := iter.Account()
+		if blob == nil {
+			log.Error("Failed to get account blob")
+			return nil
+		}
+		var account types.SlimAccount
+		if err := rlp.DecodeBytes(blob, &account); err != nil {
+			log.Error("Failed to decode", "err", err)
+			return err
+		}
+		// EIP-7610 account eligibility:
+		// - account.nonce == 0
+		// - account.runtime_code == empty
+		// - account.storage != empty
+		if len(account.CodeHash) == 0 && account.Nonce == 0 && len(account.Root) != 0 {
+			preimage := rawdb.ReadPreimage(chaindb, iter.Hash())
+			if preimage == nil {
+				log.Error("Failed to read preimage", "hash", iter.Hash().Hex())
+				return nil
+			}
+			accounts = append(accounts, common.BytesToAddress(preimage))
+		}
+	}
+	if len(accounts) == 0 {
+		log.Info("Traversed state", "eligible", len(accounts), "elapsed", common.PrettyDuration(time.Since(start)))
+	} else {
+		sort.Slice(accounts, func(i, j int) bool {
+			return accounts[i].Cmp(accounts[j]) < 0
+		})
+		buf := make([]byte, len(accounts)*common.AddressLength)
+		for i, h := range accounts {
+			copy(buf[i*common.AddressLength:], h[:])
+		}
+		log.Info("Traversed state", "eligible", len(accounts), "elapsed", common.PrettyDuration(time.Since(start)), "output", hex.EncodeToString(buf))
+	}
 	return nil
 }

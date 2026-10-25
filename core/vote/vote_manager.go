@@ -17,7 +17,12 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 )
 
-const blocksNumberSinceMining = 5 // the number of blocks need to wait before voting, counting from the validator begin to mine
+// Many validators maintain backup machines.
+// When switching from a primary node to a backup (e.g., due to failure),
+// the new node may cast votes for the same block height that the previous node already voted on.
+// To avoid double-voting issues, the node should wait for a few blocks
+// before participating in voting after it starts mining.
+const blocksNumberSinceMining = 40
 
 var diffInTurn = big.NewInt(2) // Block difficulty for in-turn signatures
 var votesManagerCounter = metrics.NewRegisteredCounter("votesManager/local", nil)
@@ -30,7 +35,7 @@ var notContinuousJustified = metrics.NewRegisteredCounter("votesManager/notConti
 // Backend wraps all methods required for voting.
 type Backend interface {
 	IsMining() bool
-	EventMux() *event.TypeMux
+	SubscribeSyncEvents(ch chan<- downloader.SyncEvent) event.Subscription
 }
 
 // VoteManager will handle the vote produced by self.
@@ -94,35 +99,19 @@ func (voteManager *VoteManager) loop() {
 	defer voteManager.highestVerifiedBlockSub.Unsubscribe()
 	defer voteManager.syncVoteSub.Unsubscribe()
 
-	events := voteManager.eth.EventMux().Subscribe(downloader.StartEvent{}, downloader.DoneEvent{}, downloader.FailedEvent{})
-	defer func() {
-		log.Debug("vote manager loop defer func occur")
-		if !events.Closed() {
-			log.Debug("event not closed, unsubscribed by vote manager loop")
-			events.Unsubscribe()
-		}
-	}()
-
-	dlEventCh := events.Chan()
+	syncCh := make(chan downloader.SyncEvent, 16)
+	syncSub := voteManager.eth.SubscribeSyncEvents(syncCh)
+	defer syncSub.Unsubscribe()
 
 	startVote := true
 	blockCountSinceMining := 0
 	for {
 		select {
-		case ev := <-dlEventCh:
-			if ev == nil {
-				log.Debug("dlEvent is nil, continue")
-				continue
-			}
-			switch ev.Data.(type) {
-			case downloader.StartEvent:
-				log.Debug("downloader is in startEvent mode, will not startVote")
+		case ev := <-syncCh:
+			switch ev.Type {
+			case downloader.SyncStarted:
 				startVote = false
-			case downloader.FailedEvent:
-				log.Debug("downloader is in FailedEvent mode, set startVote flag as true")
-				startVote = true
-			case downloader.DoneEvent:
-				log.Debug("downloader is in DoneEvent mode, set the startVote flag to true")
+			case downloader.SyncFailed, downloader.SyncCompleted:
 				startVote = true
 			}
 		case cHead := <-voteManager.highestVerifiedBlockCh:
@@ -147,19 +136,6 @@ func (voteManager *VoteManager) loop() {
 			}
 
 			curHead := cHead.Header
-			if p, ok := voteManager.engine.(*parlia.Parlia); ok {
-				// Approximately equal to the block interval of next block, except for the switch block.
-				blockInterval, err := p.BlockInterval(voteManager.chain, curHead)
-				if err != nil {
-					log.Debug("failed to get BlockInterval when voting")
-				}
-				nextBlockMinedTime := time.UnixMilli(int64((curHead.MilliTimestamp() + blockInterval)))
-				timeForBroadcast := 50 * time.Millisecond // enough to broadcast a vote
-				if time.Now().Add(timeForBroadcast).After(nextBlockMinedTime) {
-					log.Warn("too late to vote", "Head.Time(Second)", curHead.Time, "Now(Millisecond)", time.Now().UnixMilli())
-					continue
-				}
-			}
 
 			// Check if cur validator is within the validatorSet at curHead
 			if !voteManager.engine.IsActiveValidatorAt(voteManager.chain, curHead,
@@ -185,6 +161,20 @@ func (voteManager *VoteManager) loop() {
 				if sourceHash == (common.Hash{}) {
 					log.Debug("sourceHash is empty")
 					continue
+				}
+
+				if p, ok := voteManager.engine.(*parlia.Parlia); ok {
+					// Approximately equal to the block interval of next block, except for the switch block.
+					blockInterval, err := p.BlockInterval(voteManager.chain, curHead)
+					if err != nil {
+						log.Debug("failed to get BlockInterval when voting")
+					}
+					voteAssembledTime := time.UnixMilli(int64((curHead.MilliTimestamp() + p.GetAncestorGenerationDepth(curHead)*blockInterval)))
+					timeForBroadcast := 50 * time.Millisecond // enough to broadcast a vote in the same region
+					if time.Now().Add(timeForBroadcast).After(voteAssembledTime) {
+						log.Warn("too late to vote", "Head.Time(Millisecond)", curHead.MilliTimestamp(), "Now(Millisecond)", time.Now().UnixMilli())
+						continue
+					}
 				}
 
 				voteMessage.Data.SourceNumber = sourceNumber
@@ -290,9 +280,9 @@ func (voteManager *VoteManager) UnderRules(header *types.Header) (bool, uint64, 
 				log.Error("Failed to get voteData info from LRU cache.")
 				continue
 			}
-			if voteData.(*types.VoteData).SourceNumber > sourceNumber {
+			if voteData.SourceNumber > sourceNumber {
 				log.Debug(fmt.Sprintf("error: cur vote %d-->%d is across the span of other votes %d-->%d",
-					sourceNumber, targetNumber, voteData.(*types.VoteData).SourceNumber, voteData.(*types.VoteData).TargetNumber))
+					sourceNumber, targetNumber, voteData.SourceNumber, voteData.TargetNumber))
 				return false, 0, common.Hash{}
 			}
 		}
@@ -304,9 +294,9 @@ func (voteManager *VoteManager) UnderRules(header *types.Header) (bool, uint64, 
 				log.Error("Failed to get voteData info from LRU cache.")
 				continue
 			}
-			if voteData.(*types.VoteData).SourceNumber < sourceNumber {
+			if voteData.SourceNumber < sourceNumber {
 				log.Debug(fmt.Sprintf("error: cur vote %d-->%d is within the span of other votes %d-->%d",
-					sourceNumber, targetNumber, voteData.(*types.VoteData).SourceNumber, voteData.(*types.VoteData).TargetNumber))
+					sourceNumber, targetNumber, voteData.SourceNumber, voteData.TargetNumber))
 				return false, 0, common.Hash{}
 			}
 		}
